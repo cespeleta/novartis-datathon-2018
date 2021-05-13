@@ -1,0 +1,1116 @@
+---
+title: "Time Series Modeling"
+author: "Carlos Espeleta"
+date: "`r Sys.Date()`"
+output: 
+  html_notebook: 
+    toc: yes
+    toc_float: yes
+    code_folding: none
+    theme: readable
+    fig_height: 3
+    fig_width: 7
+---
+
+```{r setup, echo=FALSE}
+knitr::opts_chunk$set(
+  warning = FALSE, message = FALSE, echo = TRUE, 
+  fig.align = "center", dpi = 180, out.width = "90%"
+)
+```
+
+```{r load-libraries, echo=FALSE}
+library(tidyverse)
+library(lubridate)
+library(fable)
+library(tsibble)
+library(fable.prophet)
+library(glmnet)
+library(future)
+
+# Avoid message on summarize
+options("dplyr.summarise.inform" = FALSE)
+
+# Set default theme settings
+theme_set(theme_light())
+
+# English
+invisible(Sys.setlocale("LC_ALL", "English"))
+
+# Define paths directories
+path_data <- "../Data"
+```
+
+# Import data
+
+```{r import-data, echo=FALSE}
+data <- read_rds(file.path(path_data, "preprocessed-data.rds"))
+head(data, 3)
+```
+
+Convert to a tsibble
+
+```{r convert-to-tsibble}
+# Define `keys` and `index`
+key <- c("cluster", "brand")
+index <- "date"
+
+all_data <- data %>% 
+  unite(id, !!key, sep = "__") %>% 
+  mutate(date = yearmonth(!!sym(index))) %>%
+  as_tsibble(key = id, index = index)
+  # group_by_key() %>% 
+  # mutate_at(vars(investment_1, investment_2, others), ~ c(NA_real_, diff(.x)) ) %>% 
+  # ungroup() %>% 
+  # filter(date >= yearmonth("2012 Feb"))
+
+head(all_data, 3)
+```
+
+First and last dates
+
+```{r range-dates, echo=FALSE}
+range(all_data$date)
+```
+
+# Data preparation
+
+Split the data in train, validation and test (submission data)
+
+```{r split-data}
+# Train, validation and test evaluation
+last_train <- "2016-12-31"
+first_date_submission <- "2018-01-01"
+
+train_data <- all_data %>% 
+  filter(date <= yearmonth(last_train))
+
+valid_data <- all_data %>% 
+  filter(date > yearmonth(last_train), 
+         date < yearmonth(first_date_submission))
+
+test_data <- all_data %>% 
+  filter(date >= yearmonth(first_date_submission))
+```
+
+# Statistical Benchmarks
+
+Before doing nothing, let's compute some statistical benchmarks for all the series, that is, statistical models that just take into account past sales.
+
+```{r start-parallelization, echo=FALSE}
+# Not supported on Windows.
+my_plan <- future::plan("multicore", workers = 4L)
+# future::resetWorkers(my_plan)
+```
+
+
+## Train models
+
+Define models to use
+
+```{r baseline-definition}
+models <- list(
+  # Statistical benchmarks
+  naive    = NAIVE(sales_2),
+  snaive_1 = SNAIVE(sales_2 ~ lag("year") ),
+  snaive_2 = SNAIVE(sales_2 ~ lag("year") + drift() ),
+  arima    = ARIMA(sales_2),
+  ets      = ETS(sales_2),
+  
+  # Using Fourier terms and ARIMA errors for forecasting
+  `K = 1`  = ARIMA(sales_2 ~ fourier(K = 1) + PDQ(0, 0, 0) ),
+  `K = 2`  = ARIMA(sales_2 ~ fourier(K = 2) + PDQ(0, 0, 0) ),
+  `K = 3`  = ARIMA(sales_2 ~ fourier(K = 3) + PDQ(0, 0, 0) ),
+  `K = 4`  = ARIMA(sales_2 ~ fourier(K = 4) + PDQ(0, 0, 0) ),
+  `K = 5`  = ARIMA(sales_2 ~ fourier(K = 5) + PDQ(0, 0, 0) ),
+  `K = 6`  = ARIMA(sales_2 ~ fourier(K = 6) + PDQ(0, 0, 0) )
+)
+```
+
+Fit baseline models
+
+```{r baseline-forecast}
+fit_baselines <- train_data %>% 
+  model(!!!models)
+  # mutate(comb_0 = (arima + ets) / 2)
+
+head(fit_baselines, 3)
+```
+
+Has any model failed?
+
+```{r has-failed-any-model}
+fit_baselines %>% 
+  group_by(id) %>%
+  summarise_at(-1, is_null_model) %>% 
+  summarise_at(-1, sum)
+```
+
+## Validation forecasts
+
+Generate forecast for every single model and calculate their evaluation metrics
+
+```{r make-forecast}
+fc_baselines <- fit_baselines %>% 
+  forecast(new_data = valid_data)
+```
+
+## Evaluate models
+
+```{r echo=FALSE}
+# function (.dist, .actual, na.rm = TRUE, ...) 
+# {
+#     probs <- seq(0.01, 0.99, 0.01)
+#     percentiles <- map(probs, quantile, x = .dist)
+#     if (!is.numeric(percentiles[[1]])) 
+#         abort("Percentile scores are not supported for multivariate distributions.")
+#     map2_dbl(percentiles, probs, function(percentile, prob) {
+#         L <- ifelse(.actual < percentile, (1 - prob), prob) * 
+#             abs(percentile - .actual)
+#         mean(L, na.rm = na.rm)
+#     }) %>% mean(na.rm = na.rm)
+# }
+```
+
+```{r rank-rank-function, echo=FALSE}
+add_rank <- function(.data, var = NULL) {
+  var <- sym(var)
+  .data %>% 
+    group_by(id) %>% 
+    mutate(rank = dense_rank(!!var)) %>% 
+    ungroup() %>% 
+    arrange(id, !!var)
+}
+```
+
+Define the metrics that we want to use when evaluating the forecasts
+
+```{r metrics-definition}
+measures <- list(
+  RMSSE = RMSSE, MAPE = MAPE, MASE = MASE, CRPS = CRPS
+)
+```
+
+Calculate accuracy of each series
+
+```{r calculate-evaluation-metrics}
+acc_baselines <- fc_baselines %>% 
+  accuracy(bind_rows(train_data, valid_data), measures) %>% 
+  add_rank(var = "MAPE")
+
+head(acc_baselines, 3)
+```
+
+Performance by model
+
+```{r performance-by-model}
+acc_baselines %>% 
+  group_by(.model) %>% 
+  summarise_at(vars(RMSSE:CRPS), mean) %>% 
+  arrange(MASE) %>% 
+  head(4)
+```
+
+Performance of selecting the best model for each serie
+
+```{r performance-best-stat-model}
+acc_baselines %>% 
+  filter(rank == 1) %>% 
+  summarise_at(vars(RMSSE:CRPS), mean)
+```
+
+## Visualize forecasts
+
+```{r plot-forecast-function, echo=FALSE}
+plot_forecast <- 
+  function(fc, data = bind_rows(train_data, valid_data), 
+           facets = NULL, level = 80, scales = "fixed") {
+  
+  title <- sprintf("Forecast ID: %s", fc$id[[1]])
+  fc %>% 
+    autoplot(data, level = level) +
+    facet_wrap(facets, ncol = 2, scales = scales) +
+    guides(colour = FALSE) +
+    labs(title = title, x = NULL) +
+    theme(legend.position = "bottom")
+}
+```
+
+Visualize forecast of an specific SKU
+
+```{r fcast-viz, echo=FALSE, fig.width=4, fig.height=4}
+fc_baselines %>% 
+  filter(id == "Cluster 1__others") %>%
+  plot_forecast(facets = ".model")
+```
+
+Visualize top 6 forecasts
+
+```{r viz-best-forecasts, echo=FALSE}
+best_forecasts <- acc_baselines %>% 
+  filter(rank == 1) %>% 
+  slice_min(MASE, n = 6)
+
+fc_baselines %>% 
+  semi_join(best_forecasts, by = c("id", ".model")) %>% 
+  plot_forecast(facets = "id", scales = "free_y") +
+  labs(title = "Top 6 forecast")
+```
+
+Visualize worst 6 forecasts
+
+```{r viz-worst-forecasts, echo=FALSE}
+best_forecasts <- acc_baselines %>% 
+  filter(rank == 1) %>% 
+  slice_max(MASE, n = 6)
+
+fc_baselines %>% 
+  semi_join(best_forecasts, by = c("id", ".model")) %>% 
+  plot_forecast(facets = "id", scales = "free_y") +
+  labs(title = "Worst 6 forecast")
+```
+
+Consolidate forecasts in upper levels of aggregation
+
+```{r agg-data-upper-levels, echo=FALSE}
+agg_data <- 
+  function(.data = bind_rows(train_data, valid_data), 
+           by = "Cluster") {
+    
+  .data %>%
+    as_tibble() %>%
+    separate(id, into = c("Cluster", "Brand Group"), sep = "__") %>%
+    group_by(!!!syms(by), date) %>%
+    summarise_if(is.numeric, sum, na.rm = TRUE) %>% 
+    # summarise_at(vars(sales_1:others), sum, na.rm = TRUE) %>%
+    as_tsibble(key = by, index = date)
+}
+```
+
+```{r}
+best_forecasts <- acc_baselines %>%
+  filter(rank == 1)
+
+by <- c("Brand Group")
+agg_sales <- train_data %>% 
+  semi_join(best_forecasts, by = "id") %>%
+  agg_data(by = by)
+
+agg_forecast <- fc_baselines %>%
+  semi_join(best_forecasts, by = c("id", ".model")) %>%
+  agg_data(by = by)
+
+agg_forecast %>%
+  autoplot() +
+  autolayer(agg_sales, .vars = sales_2) +
+  labs(title = "Forecast in the validation period", 
+       subtitle = sprintf("Aggregated at %s level", by)) +
+  theme(legend.position = "bottom")
+```
+
+## Re-Train models
+
+Refit the models using all data and make the forecasts
+
+```{r refit-statistical-benchmarks}
+# Re-train models
+fit_baselines_sub <- train_data %>% 
+  bind_rows(valid_data) %>% 
+  model(!!!models)
+
+# Make forecasts to the future (submission)
+fc_baselines_sub <- fit_baselines_sub %>% 
+  forecast(new_data = test_data, )
+
+# Show the data looks like
+head(fit_baselines_sub, 3)
+```
+
+## Submission
+
+Prepare the submission file
+
+```{r prepare-submission, echo=FALSE}
+prepare_submission <- function(sub_template, fc, .model = NULL) {
+  
+  submission_models <- fc %>% 
+    as_tibble() %>% 
+    mutate(date = format(date, format = "%b %Y")) %>% 
+    pivot_wider(
+      id_cols = c(id, .model), names_from = date, 
+      values_from = .mean
+    ) %>% 
+    separate(col = id, into = c("Cluster", "Brand Group"), sep = "__")
+  
+  joined <- sub_template %>% 
+    select(Cluster, `Brand Group`) %>% 
+    left_join(submission_models, by = c("Cluster", "Brand Group"))
+  
+  if (!is.null(.model)) {
+    joined <- joined %>% 
+      filter(.model == !!.model) 
+  }
+  
+  joined %>% 
+    select(-.model)  
+}
+```
+
+```{r export-submission}
+sub_template <- read_csv(file.path(path_data, "Submission_Template1.csv"))
+prepare_submission(sub_template, fc_baselines_sub, .model = "arima") %>% 
+  head(3)
+```
+
+# External Information
+
+Now is time to add some extra information to our previous models and check whether is useful or not.
+
+## Train models
+
+Define models in a list
+
+```{r echo=TRUE}
+models_xreg <- list(
+  # Using investments as predictors
+    xreg_1   = ARIMA(sales_2 ~ investment_1),
+    xreg_2   = ARIMA(sales_2 ~ investment_1 + investment_2),
+    xreg_3   = ARIMA(sales_2 ~ investment_1 + investment_2 + investment_3),
+    xreg_4   = ARIMA(sales_2 ~ investment_1 + investment_2 + investment_3 + 
+                       investment_4 + investment_5 + investment_6)
+)
+```
+
+Train this new set of models
+
+```{r train-models-xreg}
+fit_xreg <- train_data %>% model(!!!models_xreg)
+head(fit_xreg, 3)
+```
+
+## Validation forecasts
+
+Generate forecast for every single model and calculate their evaluation metrics
+
+```{r make-forecast-xreg}
+fc_xreg <- fit_xreg %>% 
+  forecast(new_data = valid_data)
+```
+
+Combine all forecasts and evaluate their performance in the validation set
+
+```{r combine-baselines-xreg}
+fc_models <- bind_rows(fc_baselines, fc_xreg)
+```
+
+## Evaluate models
+
+Calculate accuracy of each series
+
+```{r evaluate-models}
+acc_xreg <- fc_models %>% 
+  accuracy(bind_rows(train_data, valid_data), measures) %>% 
+  add_rank(var = "MAPE")
+
+head(acc_xreg, 3)
+```
+
+Performance by model
+
+```{r performance-by-model-xreg}
+acc_xreg %>% 
+  group_by(.model) %>% 
+  summarise_at(vars(RMSSE:CRPS), mean) %>% 
+  arrange(MASE) %>% 
+  head(4)
+```
+
+Performance using this new set of models
+
+```{r performance-best-xreg-model}
+best_models <- acc_xreg %>% 
+  filter(rank == 1)
+
+best_models %>% 
+  summarise_at(vars(RMSSE:CRPS), mean)
+```
+
+## Re-Train models
+
+Refit the models using all data and make the forecasts
+
+```{r refit-xreg-models}
+# Re-train models
+fit_xreg_sub <- train_data %>% 
+  bind_rows(valid_data) %>% 
+  model(!!!models_xreg)
+
+# Make forecasts to the future (submission)
+fc_xreg_sub <- fit_xreg_sub %>% 
+  forecast(new_data = test_data)
+
+# Show the data looks like
+head(fc_xreg_sub, 3)
+```
+
+Combine all the forecasts generated so far
+
+```{r combine-baselines-and-xreg}
+fc_all_sub <- bind_rows(fc_baselines_sub, fc_xreg_sub)
+```
+
+
+## Submission
+
+```{r export-submission-xreg, echo=FALSE}
+sub_template <- read_csv(file.path(path_data, "Submission_Template1.csv"))
+
+# Select best forecasts (rank == 1) and prepare submission file
+out_to_file <- prepare_submission(sub_template, 
+  fc_all_sub %>% 
+    semi_join(best_models, by = c("id", ".model"))
+)
+
+head(out_to_file, 3)
+```
+
+
+# Combinations
+
+Combine in the same object all the single forecasts
+
+```{r combine-baselines-and-xreg-2}
+fit_models <- fit_baselines %>%
+  left_join(fit_xreg, by = "id")
+```
+
+## Create combinations
+
+```{r echo=FALSE}
+export_combinations_file <- function(fit, model_names = NULL, m = 3) {
+  if (is.null(model_names)) {
+    model_names <- names(fit)[5:ncol(fit)]
+    model_names <- paste0("`", model_names, "`")
+  }
+  combs <- combn(model_names, m)
+  
+  f <- sprintf("combinations_%d.txt", m)
+  file.create(f, showWarnings = FALSE)
+  for (i in seq(ncol(combs))) {
+    txt <- sprintf("comb_%03d = (%s) / %d,", i, paste(combs[, i], collapse = " + "), m )
+    write(txt, file = f, append=TRUE)
+  }
+}
+
+# # Example
+# export_combinations_file(
+#   fit_baselines, model_names = c("arima", "ets", "snaive_1"), m = 2)
+```
+
+Create 2 on 2 combinations
+
+```{r combinations-of-2}
+fit_models %>% 
+  export_combinations_file(m = 2)
+```
+
+Create 3 on 3 combinations
+
+```{r combinations-of-3}
+fit_models %>% 
+  export_combinations_file(m = 3)
+```
+
+Evaluate all this combinations
+
+```{r add-combinations-function, echo=FALSE}
+create_combinations <- function(fit) {
+  to_drop <- setdiff(names(fit), "id")
+  
+  fit %>% 
+    mutate(
+      comb_001 = (`arima` + `ets`) / 2,
+      comb_002 = (`arima` + `K = 1`) / 2,
+      comb_003 = (`arima` + `K = 2`) / 2,
+      comb_004 = (`arima` + `K = 3`) / 2,
+      comb_005 = (`arima` + `K = 4`) / 2,
+      comb_006 = (`arima` + `K = 5`) / 2,
+      comb_007 = (`arima` + `K = 6`) / 2,
+      comb_008 = (`ets` + `K = 1`) / 2,
+      comb_009 = (`ets` + `K = 2`) / 2,
+      comb_010 = (`ets` + `K = 3`) / 2,
+      comb_011 = (`ets` + `K = 4`) / 2,
+      comb_012 = (`ets` + `K = 5`) / 2,
+      comb_013 = (`ets` + `K = 6`) / 2
+    ) %>% 
+    select(-all_of(to_drop))
+}
+```
+
+Fit model combinations
+
+```{r fit-combination-models}
+fit_combinations <- create_combinations(fit_models)
+```
+
+Has any model failed?
+
+```{r has-any-model-failed-combs}
+fit_combinations %>% 
+  group_by(id) %>%
+  summarise_at(-1, is_null_model) %>% 
+  summarise_at(-1, sum)
+```
+
+Combine all forecasts and evaluate their performance in the validation set
+
+```{r }
+# Make forecast for the validation period
+fc_combs <- fit_combinations %>% 
+  forecast(new_data = valid_data)
+
+# Combine all forecast together
+fc_models <-
+  bind_rows(fc_baselines, fc_xreg, fc_combs)
+
+# Calculate accuracy of each series
+acc_combs <- fc_models %>% 
+  accuracy(bind_rows(train_data, valid_data), measures) %>% 
+  add_rank(var = "MAPE")
+
+head(acc_combs, 3)
+```
+
+
+```{r}
+best_models <- acc_combs %>% 
+  filter(rank == 1)
+
+best_models %>% 
+  summarise_at(vars(MAPE, MASE, CRPS), mean)
+```
+
+## Visualize forecasts
+
+Visualize top 6 forecasts
+
+```{r echo=FALSE}
+best_forecasts <- best_models %>% 
+  slice_min(MASE, n = 6)
+
+fc_models %>% 
+  semi_join(best_forecasts, by = c("id", ".model")) %>% 
+  plot_forecast(facets = "id", scales = "free_y") +
+  labs(title = "Top 6 forecast")
+```
+
+Visualize worst 6 forecasts
+
+```{r viz-worst-forecasts-combs, echo=FALSE}
+worst_forecasts <- best_models %>% 
+  slice_max(MASE, n = 6)
+
+fc_models %>% 
+  semi_join(worst_forecasts, by = c("id", ".model")) %>% 
+  plot_forecast(facets = "id", scales = "free_y") +
+  labs(title = "Worst 6 forecast")
+```
+
+## Re-Train models
+
+```{r combine-baselines-xreg-combs-submission}
+fit_combs_sub <- fit_baselines_sub %>%
+  left_join(fit_xreg_sub, by = "id") %>% 
+  create_combinations()
+
+# Make forecasts to the future (submission)
+fc_combs_sub <- fit_combs_sub %>% 
+  forecast(new_data = test_data)
+```
+
+Combine all the forecasts generated so far
+
+```{r combine-baselines-xreg-combs}
+fc_all_sub <- 
+  bind_rows(fc_baselines_sub, fc_xreg_sub, fc_combs_sub)
+```
+
+## Submission
+
+Select best forecasts (`rank == 1`) and prepare the submission file
+
+```{r submission-file-combinations}
+out_to_file <- prepare_submission(sub_template, 
+  fc_all_sub %>% 
+    semi_join(best_models, by = c("id", ".model"))
+)
+
+head(out_to_file, 3)
+```
+
+
+# Metrics Based
+
+Combine forecast based on the error produced on the validation set
+
+```{r calibrate-metrics-function, echo=FALSE}
+calibrate_metrics <- function(.data, metric = "MASE", n_models = 3) {
+  metric <- sym(metric)
+  
+  .data %>% 
+    filter(rank <= n_models) %>% 
+    group_by(id) %>% 
+    mutate(
+      wgts = (1 / {{ metric }}) / sum(1 / {{ metric }})
+    ) %>% 
+    ungroup() %>% 
+    select(.model, id, {{ metric }}, rank, wgts)
+}
+
+calibrate_tbl <- calibrate_metrics(acc_xreg, metric = "MASE", n_models = 2)
+calibrate_tbl <- calibrate_tbl %>% arrange(id)
+head(calibrate_tbl, 3)
+```
+
+
+```{r}
+fit_combinations %>% 
+  filter(id == "Cluster 1__Brand Group 41") %>% 
+  select(id, comb_164) %>% 
+  generate(times = 100, new_data = valid_data) %>%
+  as_tibble() %>%
+  group_by(date) %>%
+  summarise(
+    qs = quantile(.sim, seq(from = 0.1, to = 0.9, by = 0.1)), 
+    prob = seq(from = 0.1, to = 0.9, by = 0.1)
+  ) %>%
+  ggplot(aes(x = date)) +
+  geom_line(aes(y = qs, group = prob), col = "blue", alpha = 0.5) +
+  geom_line(aes(y = sales_2), data = valid_data %>% filter(id == "Cluster 1__others")) +
+  geom_line(aes(y = sales_2), data = train_data %>% filter(id == "Cluster 1__others")) +
+  labs(x = "Month", y = "Turnover (A$million)")
+```
+
+
+
+# Ensembles
+
+Figure 1: future sample paths
+
+```{r}
+future <- fit %>%
+  filter(id == "Cluster 1__Brand Group 17") %>% 
+  # select(-contains("naive")) %>%
+  select(arima, ets, xreg_3) %>%
+  generate(times = 10, new_data = valid_data) %>%
+  mutate(modrep = paste0(.model, .rep))
+
+train_data %>%
+  filter(id == "Cluster 1__Brand Group 17") %>% 
+  autoplot(sales_2) +
+  geom_line(
+    data = future %>% 
+      filter(id == "Cluster 1__Brand Group 17"),  
+    aes(y = .sim, col = .model, group = modrep)) +
+  guides(colour = guide_legend("Model"))
+```
+
+Deciles from ETS model
+
+```{r}
+fit %>%
+  select(ets) %>%
+  filter(id == "Cluster 1__Brand Group 17") %>% 
+  generate(times = 1000, h = "1 year") %>%
+  as_tibble() %>%
+  group_by(date) %>%
+  summarise(
+    qs = quantile(.sim, seq(from = 0.1, to = 0.9, by = 0.1)), 
+    prob = seq(from = 0.1, to = 0.9, by = 0.1)
+  ) %>%
+  ggplot(aes(x = date)) +
+  geom_line(aes(y = qs, group = prob), col = "blue", alpha = 0.5) +
+  geom_line(aes(y = sales_2), data = valid_data %>% filter(id == "Cluster 1__others")) +
+  geom_line(aes(y = sales_2), data = train_data %>% filter(id == "Cluster 1__others")) +
+  labs(x = "Month", y = "Turnover (A$million)")
+```
+
+Ensemble combining ETS and ARIMA sample paths
+
+```{r}
+ensemble <- fc %>% 
+  filter(id == "Cluster 1__Brand Group 17") %>% 
+  filter(.model %in% c("arima", "ets")) %>% 
+  group_by(id) %>% 
+  summarise(
+    sales_2 = distributional::dist_mixture( 
+      sales_2[1], sales_2[2], weights = c(0.3, 0.7)
+    )
+  ) %>% 
+  transmute(.model = "ENSEMBLE", sales_2) %>%
+  # as_fable(key = "id") %>% 
+  as_fable(response = "sales_2", distribution = sales_2)
+
+ensemble %>% 
+  accuracy(data = bind_rows(train_data, valid_data), 
+           measures = list(mase = MASE, crps = CRPS))
+```
+
+
+```{r}
+ensemble <- fit %>%
+  filter(id == "Cluster 1__Brand Group 17") %>% 
+  select(arima, ets, xreg_3) %>%
+  # select(-contains("naive")) %>%
+  generate(times = 100, new_data = valid_data) %>%
+  summarise(
+    # value = distributional::dist_sample(list(.sim)),
+    value = distributional::dist_mixture(list(.sim), weights = c(0.4, 0.3, 0.3)),
+    .mean = mean(value)
+  ) %>%
+  mutate(
+    .model = "ENSEMBLE"
+  ) %>% 
+  as_fable(distribution = value, response = "value")
+```
+
+```{r}
+ensemble %>% 
+  ggplot(aes(x = date)) +
+  geom_line(aes(y = .mean), col = "blue", alpha = 0.5) +
+  geom_line(aes(y = sales_2), data = valid_data %>% filter(id == "Cluster 1__others")) +
+  geom_line(aes(y = sales_2), data = train_data %>% filter(id == "Cluster 1__others")) +
+  labs(x = "Month", y = "Turnover (A$million)")
+```
+
+# Glmnet Ensemble
+
+There are two types of ensembles that we can create here: `local` and `global` ensembles.
+
+* `local` ensembles are build one for each time series.
+* `global` ensembles use the information of all the series to improve the overall forecast accuracy.
+
+## Local model
+
+```{r function-round-sum-one, echo=FALSE}
+# https://biostatmatt.com/archives/2902
+round_preserve_sum <- function(x, digits = 0) {
+  up <- 10 ^ digits
+  x <- x * up
+  y <- floor(x)
+  indices <- tail(order(x-y), round(sum(x)) - sum(y))
+  y[indices] <- y[indices] + 1
+  y / up
+}
+```
+
+
+```{r glmnet-auxiliary-function, echo=FALSE}
+fit_glmnet <- function(data, X = NULL, y = NULL, max_weights = NULL) {
+  
+  lambdas <- 10 ^ seq(3, -6, by = -.1)  
+  
+  X <- as.matrix(data[X])
+  y <- data[[y]]
+  
+  # Cross validation to find optimal lambda
+  cv_lasso <- cv.glmnet(X, y, alpha = 1, lambda = lambdas)
+  optimal_lambda <- cv_lasso$lambda.min
+  
+  # Fit the model
+  lasso_reg <- glmnet(
+    X, y, alpha = 1, family = 'gaussian', 
+    lambda = optimal_lambda, na.action = na.omit, 
+    intercept = TRUE #, lower.limits = 0
+  )
+  
+  # Export weights
+  weights <- tidy(lasso_reg, return_zeros = TRUE) %>% 
+    filter(term != "(Intercept)") %>% 
+    select(term, estimate, lambda)
+    
+  if (!is.null(max_weights)) {
+    weights <- weights %>% 
+      slice_max(estimate, n = max_weights)
+  }
+  
+  weights <- weights %>% 
+    mutate(weight = estimate / sum(estimate))
+  
+  if (all(weights$estimate == 0)) {
+    weights$weight <- 1 / ncol(X)
+  }
+  weights$weight <- round_preserve_sum(weights$weight, 2)
+  weights
+}
+```
+
+First of all, we must set out forecast in wide format, that is, one column per model.
+
+```{r}
+# bind_rows(fc_baselines, fc_xreg)
+
+fcast_wide <- fc_baselines %>% 
+  select(id, .model, .mean) %>% 
+  pivot_wider(id_cols = c(id, date), names_from = .model, values_from = .mean) %>% 
+  left_join(
+    select(valid_data, id, date, sales_2), by = c("id", "date")    
+  ) %>% 
+  relocate(id, date, sales_2)
+
+head(fcast_wide, 3)
+```
+
+Define which models use as precictors and set the target variable
+
+```{r define-predictors-and-target}
+# X <- names(fcast_wide)[-1]
+X <- c("naive", "snaive_1", "snaive_2", "arima", "ets", 
+       "K = 1", "K = 2", "K = 3", "K = 4", "K = 5", "K = 6")
+y <- "sales_2"
+```
+
+For each `id` calculate the weights
+
+```{r}
+weights_df <- fcast_wide %>% 
+  group_by(id) %>% 
+  nest() %>% 
+  mutate(
+    weights = map(data, ~ fit_glmnet(.x, X = X, y = y) )
+  )
+
+head(weights_df, 3)
+```
+
+Then, `unnest` the `weights`
+
+```{r}
+weights_df_long <- weights_df %>% 
+  unnest(weights) %>% 
+  select(id, term, estimate, weight) %>% 
+  as_tibble()
+
+head(weights_df_long, 3)
+```
+
+```{r}
+weights_df_wide <-  weights_df_long %>% 
+  pivot_wider(id_cols = id, names_from = term, values_from = weight)
+
+head(weights_df_wide, 3)
+```
+
+
+```{r}
+# fc_baselines %>% 
+#   select(id, .model, date, .mean) %>% 
+#   left_join(
+#     pivot_longer(weights_df_wide, cols = -"id", names_to = ".model", values_to = "weight"),
+#     by = c("id", ".model")
+#   ) %>% 
+#   mutate(
+#     ensemble = .mean * weight
+#   ) %>% 
+#   as_tibble() %>% 
+#   group_by(id, date) %>%
+#   summarise(
+#     ensemble = sum(ensemble)
+#   )
+```
+
+```{r}
+# fc_baselines_sub %>%
+fc_baselines %>% 
+  filter(
+    id %in% c("Cluster 1__Brand Group 17", "Cluster 1__Brand Group 24")
+  ) %>% 
+  select(id, date, .model, .mean) %>% 
+  pivot_wider(
+    id_cols = c(id, date), names_from = .model, values_from = .mean
+  ) %>% 
+  as_tibble() %>% 
+  select(-date) %>% 
+  nest_by(id, .key = "forecasts") %>% 
+  left_join(
+    weights_df_wide %>% nest_by(id, .key = "weights"), by = "id"
+  ) %>% 
+  head() %>% 
+  mutate(
+    ensemble = map2(forecasts, weights, )
+  )
+```
+
+
+
+```{r}
+
+X <- fc_baselines %>% 
+  filter(id %in% c("Cluster 1__Brand Group 17") )
+
+w <- weights_df_long %>% 
+  filter(id %in% c("Cluster 1__Brand Group 17") )
+
+wgts <- setNames(w$weight, w$term)
+wgts
+
+foreast_ensemble <- function(data) {
+  
+  wgts <- data %>% distinct(.model, weight)
+  wgts <- setNames(wgts$weight, wgts$.model)
+  
+  data %>% 
+    select(-estimate, -weight) %>% 
+    group_by(id) %>% 
+    summarise(
+      sales_2 = distributional::dist_mixture(
+        list(sales_2), weights = w$weight
+      )
+    ) %>% 
+    transmute(.model = "ENSEMBLE", sales_2) %>% 
+    as_fable(key = c(id, .model))
+}
+
+a <- fc_baselines %>% 
+  select(id, .model, date, sales_2, .mean) %>% 
+  filter(
+    id %in% c("Cluster 1__Brand Group 17", "Cluster 1__Brand Group 24")
+  ) %>% 
+  left_join(
+    weights_df_long %>% rename(.model = term), by = c("id", ".model")
+  ) %>% 
+  group_split(id) %>% 
+  map_dfr(foreast_ensemble)
+
+
+a %>% 
+  left_join()
+
+# data <- a[[1]]
+# a[[1]] %>% distinct(.model, weight)
+```
+
+
+```{r}
+X <- fc_baselines %>% 
+  filter(id %in% c("Cluster 1__Brand Group 17") )
+  # pivot_wider(id_cols = c(id, date), names_from = .model, values_from = sales_2)
+
+w <- weights_df_long %>% 
+  filter(id %in% c("Cluster 1__Brand Group 17") )
+
+foreast_ensemble <- function(id, X, w) {
+  # w_names <- w$term
+  # X %>% select_if(~ inherits(.x, what = "distribution")),
+  
+  print(id)
+  
+  X %>% 
+    summarise(
+      sales_2 = distributional::dist_mixture(
+        list(sales_2), weights = w$weight
+      )
+    ) %>% 
+    transmute(id = id, .model = "ENSEMBLE", sales_2) %>%
+    tsibble(key = c(id, .model), index = date) %>%
+    as_fable(response = "sales_2", distribution = sales_2)
+}
+
+
+fc_glmnet_local <- fc_baselines %>% 
+  filter(
+    id %in% c("Cluster 1__Brand Group 17", "Cluster 1__Brand Group 24")
+  ) %>% 
+  group_by(id) %>% 
+  nest() %>% 
+  left_join(
+    weights_df_long %>% nest_by(id, .key = "weights"), by = "id"
+  ) %>% 
+  mutate(
+    ensemble = pmap(
+      .l = list(id, data, weights),
+      .f = foreast_ensemble
+    )
+  )
+  
+fc_glmnet_local <- bind_rows(fc_glmnet_local$ensemble)
+head(fc_glmnet_local)
+
+
+
+fc_baselines %>% filter(.model == "naive") %>% bind_rows(fc_glmnet_local) %>% View()
+  # as_tsibble(key = id, index = date) %>% 
+  # transmute(.model = "ENSEMBLE", ensemble) %>% 
+  # # as_fable(key = "id", index = "date") %>%
+  # as_fable(response = "sales_2", distribution = ensemble)
+```
+
+Evaluate ensemble on validation
+
+```{r}
+fc_baselines %>% 
+  bind_rows(a) %>% 
+  accuracy(bind_rows(train_data, valid_data), measures) %>% 
+  add_rank(var = "MAPE")
+```
+
+Re-Train models
+
+```{r}
+
+
+
+```
+
+Submission
+
+```{r}
+
+```
+
+
+
+
+## Global model
+
+
+```{r}
+
+
+
+```
+
+
+
+
+
+
+Not all products have the same investments, so let's split them in groups
+
+```{r groups-by-predictors}
+split_groups <- train_data %>% 
+  as_tibble() %>%
+  group_by(id) %>% 
+  summarise(
+    has_investment_1 = sum(investment_1) != 0,
+    has_investment_2 = sum(investment_2) != 0,
+    has_investment_3 = sum(investment_3) != 0,
+    has_investment_4 = sum(investment_4) != 0,
+    has_investment_5 = sum(investment_5) != 0,
+    has_investment_6 = sum(investment_6) != 0
+  )
+
+group_with_everything <- split_groups %>% 
+  filter(has_investment_1, has_investment_2, has_investment_3, 
+         has_investment_4, has_investment_5, has_investment_6)
+
+group_with_missings <- split_groups %>% 
+  semi_join(group_with_everything, )
+
+
+dim(group_with_everything)
+```
+
+
+
+

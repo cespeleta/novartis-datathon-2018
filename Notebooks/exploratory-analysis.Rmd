@@ -1,0 +1,1001 @@
+---
+title: "Exploratory Data Analysis"
+author: "Carlos Espeleta"
+date: "`r Sys.Date()`"
+output: 
+  html_notebook: 
+    toc: yes
+    toc_depth: 2
+    toc_float:
+      collapsed: no
+      smooth_scroll: no
+    code_folding: none
+    theme: cosmo
+    highlight: tango
+    css: include/center.css
+    includes:
+      in_header: include/favicon.html
+editor_options: 
+  markdown: 
+    wrap: 90
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  warning = FALSE, message = FALSE, echo = FALSE, 
+  fig.width = 7, fig.align = "center", 
+  out.width = "95%", dpi = 72
+)
+```
+
+```{r load-libraries, echo=FALSE}
+# Load packages
+library(tidyverse)
+library(lubridate)
+library(patchwork)
+library(plotly)
+library(highcharter)
+library(crosstalk)
+library(collapsibleTree)
+
+# Avoid message on summarize
+options(dplyr.summarise.inform = FALSE)
+
+# Set default theme settings
+theme_set(
+  theme_light() +
+    theme(legend.position = "bottom")
+)
+
+# English
+invisible(Sys.setlocale("LC_ALL", "English"))
+
+# Define paths directories
+path_data <- "../Data"
+
+# Define last train date
+last_train <- "2018-01-01"
+```
+
+```{r knitr-table-aux}
+to_html <- function(df, digits = 2, ...) {
+  knitr::kable(df, format = "html", digits) %>% 
+    kableExtra::kable_styling(
+      bootstrap_options = c("striped", "hover", "condensed"),
+      ...
+    )
+}
+```
+
+```{r logo-novartis, echo=FALSE, out.width='100%'}
+knitr::include_graphics('../Images/logo-novartis.png')
+```
+
+# The Challenge {.unnumbered}
+
+Finance has the responsibility to forecast, plan and allocate resources in order to
+successfully deliver the best treatments to our patients.
+
+-   The **first** challenge consist of deliver sales forecast for 2018 per cluster, per
+    brand and per month.
+
+-   The **second** challenge is to provide the optimal allocation of their resources
+    for the year 2018.
+
+# Executive summary {.unnumbered}
+
+
+- An extensive exploratory data analysis has been carried out. It starts looking the aggregated levels of the data and, little by little, it focuses on more detailed aspects until it reaches the product level.
+
+- After analyzing the data, it can be concluded that a few products have most of the weight of the portfolio. Therefore, reducing the forecast error on this products will provide better savings to Novartis.
+
+- Different time series models have been evaluated with a holdout split. For every product, the best model has been selected to generate the final forecast. The overall MAPE is 15%.
+
+- To solve the allocation problem, multiple scenarios have been generated in order to find the best combination of investments for 2018.
+
+# Data preparation
+
+All the data was provided in a single Excel file. This file contains for each brand of
+products two geographical levels (cluster and country), sales and investments in a monthly
+granularity.
+
+Looking at the file, it seems a direct export from their CRM, time series data in wide
+format, with the totals of each quarter. This dataset needs some cleaning before starting
+to work with it.
+
+```{r import-data, echo=FALSE}
+# Load excel file
+df_raw <- 
+  readxl::read_excel(
+    path = file.path(path_data, "Data_Novartis_Datathon-Participants.xlsx"), 
+    sheet = "Sheet1",
+    skip = 3
+  )
+
+# Show first rows and columns
+head(df_raw, 5) %>% 
+  select(1:8) %>% 
+  to_html(digits = 1)
+```
+
+The dimensions of the file are:
+
+```{r dimensions-raw}
+dim(df_raw)
+```
+
+Summary of the provided data:
+
+-   **Cluster** (9): Highest level of geographical break down
+
+-   **Country** (53): Lowest level of geographical break down
+
+-   **Brand Group** (53): A pharmaceutical product
+
+-   **Function** (8): Financial information related to:
+
+    -   **Sales 1**: Gross sales = volume sold \* price
+    -   **Sales 2**: Net Sales = *Sales 1* - Revenue deduction/ etc.
+    -   **Investment 1-6**: different investment types
+
+Sales data is available from 2012 through 2017, while investments are available through
+2018.
+
+```{r collapsible-tree-plot}
+collapsibleTree(
+  df = df_raw %>% 
+    distinct(Cluster, Country, `Brand Group`) %>% 
+    mutate(Cluster = fct_relevel(Cluster, paste("Cluster", seq(1, 10)))) %>% 
+    arrange(Cluster),
+  root = "Total sales", 
+  hierarchy = c("Cluster", "Country", "Brand Group"),
+  fillByLevel = TRUE, 
+  zoomable = FALSE, height = 500, fontSize = 14, width = "100%")
+```
+
+## Cleaning up {#clean-headers}
+
+As mentioned before, we are going to clean up the dataset with the following steps:
+
+-   Remove totals of each quarter
+-   Rename `Brand Group` to `brand`
+-   Convert all headers to lower strings
+
+```{r clean-raw-data-format, echo=TRUE}
+df_raw <- df_raw %>% 
+  rename(brand = `Brand Group`) %>% 
+  select(-contains("...")) %>% 
+  set_names(tolower)
+```
+
+```{r}
+# Show snapshot
+head(df_raw, 4) %>% 
+  select(1:8) %>% 
+  to_html(digits = 1)
+```
+
+If we wanted to perform forecasts at the lowest possible level (cluster, country, brand)
+how many *SKU* we should have to forecast?
+
+```{r num-of-forecast-at-low-level, echo=FALSE}
+n_sku <- df_raw %>% distinct(cluster, brand, country) %>% nrow()
+sprintf("There are a total of %d SKU's to forecast", n_sku)
+```
+
+## Re-code brands {#recode-brands}
+
+The forecast is only required for the following brands
+
+```{r preparing-groups, echo=TRUE}
+data_wide <- df_raw %>% 
+  mutate(
+    brand = case_when(
+      brand %in% "Brand Group 17" ~ "Brand Group 17",
+      brand %in% "Brand Group 24" ~ "Brand Group 24",
+      brand %in% "Brand Group 30" ~ "Brand Group 30",
+      brand %in% "Brand Group 31" ~ "Brand Group 31",
+      brand %in% "Brand Group 36" ~ "Brand Group 36",
+      brand %in% "Brand Group 41" ~ "Brand Group 41",
+      brand %in% paste("Brand Group", c(51, 73, 90)) ~ "Brand Group 51, 73, 90",
+      brand %in% paste("Brand Group", c(96, 97)) ~ "Brand Group 96, 97",
+      TRUE ~ "Others"
+    )
+)
+```
+
+```{r show-data-preprocessed}
+head(data_wide, 6) %>% 
+  select(1:8) %>% 
+  to_html(digits = 1)
+```
+
+After this aggregations, we have:
+
+```{r num-sku-to-forecast}
+n_sku <- data_wide %>% distinct(cluster, brand) %>% nrow()
+sprintf("There are %d SKU's to forecast", n_sku)
+```
+
+## Reshape the data {#reshape-data}
+
+Convert the `data.frame` to long format using `pivot_longer` and `pivot_wider`. Now, all
+the date columns have disappeared and all the dates appear in the `date` column. The data
+frame also contains sales and investments columns.
+
+```{r wide-to-long, echo=TRUE}
+data_long <- data_wide %>% 
+  mutate(
+    `function` = `function` %>% str_to_lower() %>% str_replace(" ", "_") 
+  ) %>% 
+  pivot_longer(
+    cols = -c(cluster, brand, country, `function`), 
+    names_to = "date", 
+    values_to = "value",
+    names_transform = list(date = ~ parse_date_time(.x, orders = "my") ), 
+  ) %>% 
+  pivot_wider(
+    id_cols = c(cluster, brand, country, date),
+    names_from = `function`, 
+    names_sort = TRUE,
+    values_from = value,
+    values_fn = sum
+  ) %>% 
+  select(cluster:date, starts_with("sales"), starts_with("investment"))
+```
+
+```{r reorder-cluster-levels}
+# Cluster as factor for better plots
+cluster_lvls <- paste("Cluster", seq(1, 10))
+data_long <- data_long %>% 
+  mutate(cluster = fct_relevel(cluster, cluster_lvls))
+```
+
+```{r show-data-long}
+head(data_long, 3) %>% 
+  to_html(digits = 1) %>% 
+  kableExtra::scroll_box(width = "100%")
+```
+
+# Sales Visual Overview
+
+We will start our visual exploration by investigating a number of time series plots on
+different aggregation levels. Then, we will continue exploring the relationship of the
+sales with their own past sales and the different investment.
+
+```{r plot-aux-functions}
+plot_time_series <- function(data, x, y, y_second, ..., line_size = 0.5) {
+  
+  x <- rlang::enquo(x)
+  y <- rlang::enquo(y)
+  
+  p <- ggplot(data, aes(x = {{ x }}, y = {{ y }}, ...)) +
+    geom_line(size = line_size) +
+    scale_y_continuous(
+      labels = scales::label_number(suffix = "K", scale = 1e-3)
+    ) +
+    theme(legend.position = "bottom") +
+    labs(x = NULL, y = NULL, colour = NULL)
+  
+  if (!missing(y_second)) {
+    y_second <- rlang::enquo(y_second)
+    p <- p +
+      geom_line(aes(y = {{ y_second }} ), color = "orange", 
+                size = line_size, alpha = 0.5)
+  }
+  p
+}
+```
+
+## All aggregate sales
+
+-   The overall sales present an uptrend, specially after 2016.
+-   There is a dip in sales in august.
+
+```{r viz-total-sales}
+data <- data_long
+
+total_sales <- data %>% 
+  filter(date <= last_train) %>% 
+  group_by(date) %>% 
+  summarise_at(vars(sales_1:investment_6), sum, na.rm = TRUE) %>%
+  ungroup()
+
+# plot_time_series(total_sales, x = date, y = sales_2) +
+#   labs(title = "Total sales")
+
+plot_ly(total_sales, x = ~date, y = ~sales_2, mode = "lines") %>% 
+  layout(
+    title = "Total sales",
+    xaxis = list(
+      title = NA_character_,
+      type = "date",
+      rangeselector = list(
+        buttons = list(
+          list(
+            count = 6,
+            label = "6 mo",
+            step = "month",
+            stepmode = "backward"),
+          list(
+            count = 1,
+            label = "1 yr",
+            step = "year",
+            stepmode = "backward"),
+          list(
+            count = 4,
+            label = "4 yr",
+            step = "year",
+            stepmode = "backward"),
+          list(step = "all") 
+        )
+      )
+    ),
+    yaxis = list(title = NA_character_),
+    legend = list(orientation = "h"), 
+    autosize = F, width = 700#, height = 400
+  )
+```
+
+Let's break down the sales into geographies and brands.
+
+## Geography
+
+There are two geographical levels: Cluster and Country.
+
+### Cluster
+
+Highest level of geographical break down
+
+```{r unique-cluster, echo=FALSE}
+levels(data$cluster)
+```
+
+```{r agg-by-cluster}
+palette <- "Set3" #  "Spectral"
+
+by_cluster <- data %>% 
+  filter(date <= last_train) %>% 
+  group_by(cluster, date) %>% 
+  summarise_at(vars(sales_1:investment_6), sum, na.rm = TRUE) %>% 
+  ungroup()
+```
+
+Form the image below we can see that how *Cluster 10*, *Cluster 3*, and *Cluster 2* are
+the most important ones regarding sales, and *Cluster 7* is the less important. It seems
+that there are two groups of clusters, one with the top three and other with the rest of
+the clusters.
+
+```{r viz-boxplot-by-clusters}
+by_cluster %>% 
+  ggplot(aes(x = fct_reorder(cluster, sales_2), y = sales_2, fill = cluster)) +
+  geom_boxplot(alpha = 0.8) +
+  scale_y_continuous(labels = scales::number) +
+  scale_fill_brewer(palette = palette) +
+  scale_y_continuous(
+    labels = scales::label_number(suffix = "K", scale = 1e-3)
+  ) +
+  coord_flip() +
+  theme(legend.position = "none") +
+  labs(x = NULL, y = NULL, colour = NULL, fill = NULL)
+```
+
+Let's see how the sales look like in the past. This time we want to explore visually if
+some clusters are more trending than others, are stationary or do present seasonal
+patterns.
+
+-   *Cluster 4* seems quite seasonal
+-   *Cluster 3* is the most trending one. *Cluster 8* and *Cluster 10* also have some
+    trend.
+-   *Cluster 1*, *5* and *7* are stable, do not increase/decrease over this period.
+
+```{r viz-cluster}
+plot_time_series(by_cluster, x = date, y = sales_2, colour = cluster, line_size = 1) +
+  scale_color_brewer(palette = palette) +
+  # facet_wrap(~ cluster, ncol = 3) +
+  # labs(title = "Clusters")
+  labs(title = NULL)
+```
+
+It is interesting to see how some clusters concentrate many countries while others are
+simply formed by one. However, despite these differences, the number of brands in all the
+countries is 8 or 9 except in *Cluster 7* with 5 brands.
+
+Another way of looking at the data is by it's contribution to the portfolio. How much
+weight each country has? Almost 60% of the portfolio belongs to *Clusters 10*, *Cluster 3*
+and *Cluster 2*.
+
+-   *Cluster 1* contains most countries, followed by *Cluster 10* and *Cluster 5* with 36,
+    6 and 4 countries respectively.
+
+-   *Clusters 2*, *3*, *4*, *7* and *8* only have one country.
+
+```{r summary-stats-by-cluster}
+tree_map <- data %>% 
+  group_by(cluster) %>% 
+  summarise(
+    `Number of countries` = n_distinct(country),
+    `Number of brands` = n_distinct(brand),
+    Weight = sum(sales_2, na.rm = TRUE)
+  ) %>%
+  mutate(Weight = Weight / sum(Weight)) %>% 
+  ungroup() %>% 
+  rename(Cluster = cluster)
+
+tree_map %>% 
+    to_html(digits = 2, full_width = FALSE)
+```
+
+Another way of looking at this data is with a tree map plot. As bigger the square it is
+more contribution to the portfolio they have, and as darker the shade it is, more
+countries in each cluster there are.
+
+```{r cluster-treemap}
+pointFormatter <- highcharter::JS("function(){
+  return '<b>Weight</b>: ' + this.w_text + '<br>' + '<b>Countries</b>: ' + 
+  this['Number of countries']
+}")
+
+tree_map %>% 
+  mutate(w_text = scales::percent(Weight, accuracy = 0.01)) %>%
+  hchart("treemap", 
+         hcaes(x = Cluster, value = Weight, color = `Number of countries`), 
+         name = "Weight") %>% 
+  hc_tooltip(pointFormatter = pointFormatter) %>% 
+  hc_legend(align = "right", valueDecimals = 0) 
+```
+
+### Country
+
+Lowest level of geographical break down
+
+```{r print-number-of-countries}
+sprintf("Number of countries: %d", n_distinct(data$country))
+```
+
+```{r unique-country, echo=FALSE}
+sort(unique(data$country))[1:10]
+```
+
+```{r agg-by-country}
+by_country <- data %>% 
+  filter(date <= last_train) %>% 
+  group_by(cluster, country, date) %>% 
+  summarise(value = sum(sales_2, na.rm = TRUE), .groups = "drop") %>% 
+  mutate(cluster = fct_relevel(cluster, cluster_lvls)) %>%
+  group_by(cluster) %>% 
+  mutate(
+    cluster_label = sprintf("%s (n=%d)", cluster, n_distinct(country)),
+    cluster_label = fct_relevel(cluster_label, cluster_lvls)
+  ) %>% 
+  ungroup()
+```
+
+```{r top-bottom-countries}
+# Calculate top and bottom countries to plot
+# them ordered in a boxplot
+total_by_country <- by_country %>% 
+  group_by(country) %>% 
+  summarise(total_sales = sum(value, na.rm = TRUE))
+
+n <- 25
+
+# Select top `n` (25)
+top_n_ <- total_by_country %>% 
+  top_n(total_sales, n = n) %>% 
+  pull(country)
+
+# Select bottom `n` (25)
+bottom_n_ <- total_by_country %>% 
+  top_n(total_sales, n = -n) %>% 
+  pull(country)
+```
+
+-   Most sales come from few countries
+-   There are many countries with very few sales
+-   Countries like *Country 25*, *20* or *40* might have outliers. Before treat them as
+    such, we should investigate if these values are due to increase/decrease in
+    investments, marketing, etc.
+-   *Country 40* has high variability, as well as negative sales values.
+
+```{r viz-boxplot-by-country, fig.width=7, fig.height=7}
+gg_top <- by_country %>% 
+  filter(country %in% top_n_) %>% 
+  ggplot(aes(x = fct_reorder(country, value), y = value, fill = country)) +
+  geom_boxplot(alpha = 0.8) +
+  scale_y_continuous(labels = scales::number) +
+  scale_fill_brewer(palette = palette) +
+  scale_y_continuous(
+    labels = scales::label_number(suffix = "K", scale = 1e-3)
+  ) +
+  coord_flip() +
+  theme(legend.position = "none") +
+  labs(
+    title = sprintf("Top %d countries", n), 
+    x = NULL, y = NULL
+  )
+
+gg_bottom <- by_country %>% 
+  filter(country %in% bottom_n_) %>%
+  ggplot(aes(x = fct_reorder(country, value), y = value, fill = country)) +
+  geom_boxplot(alpha = 0.8) +
+  scale_y_continuous(labels = scales::number) +
+  scale_fill_brewer(palette = palette) +
+  scale_y_continuous(
+    labels = scales::label_number(suffix = "K", scale = 1e-3)
+  ) +
+  coord_flip() +
+  theme(legend.position = "none") +
+  labs(
+    title = sprintf("Bottom %d countries", n), 
+    x = NULL, y = NULL
+  )
+
+gg_top | gg_bottom
+```
+
+All negative sales belong to cluster 1. There are 14 countries with negative values but
+without a doubt the most important one is *Country 40* with 52 months with negative sales.
+
+```{r viz-ccountry, fig.height=6, fig.width=8, echo=FALSE}
+by_country %>% 
+  plot_time_series(x = date, y = value, colour = country) +
+  facet_wrap(~ cluster_label, ncol = 3, scales = "free_y") +
+  theme(legend.position = "none")
+```
+
+In case that we would like to see the 14 countries with negative sales
+
+```{r count-countries-with-negative-sales, echo=TRUE, eval=FALSE}
+# Code to count cluster-countries with negative sales
+by_country %>% 
+  filter(value < 0) %>% 
+  count(cluster, country, sort = TRUE)
+```
+
+We confirm that the two biggest countries are *Country 19* and *Country 17*. The same
+shade of blue is maintained throughout the matrix, indicating that most countries have the
+same number of brands.
+
+```{r country-treemap-data}
+tree_map_country <- data %>% 
+  group_by(country) %>% 
+  summarise(
+    `Number of brands` = n_distinct(brand),
+    Weight = sum(sales_2, na.rm = TRUE)
+  ) %>%
+  mutate(Weight = Weight / sum(Weight)) %>% 
+  rename(Country = country)
+```
+
+```{r country-treemap-plot}
+pointFormatter <- JS("function(){
+  return '<b>Weight</b>: ' + this.w_text + '<br>' + '<b>Brands</b>: ' + 
+  this['Number of brands']
+}")
+
+tree_map_country %>% 
+  mutate(w_text = scales::percent(Weight, accuracy = 0.01)) %>%
+  hchart("treemap", 
+         hcaes(x = Country, value = Weight, color = `Number of brands`), 
+         name = "Weight") %>% 
+  hc_tooltip(pointFormatter = pointFormatter) %>% 
+  hc_legend(align = "right", valueDecimals = 0)
+```
+
+## Brand Group
+
+A Pharmaceutical product
+
+```{r unique-brand, echo=FALSE}
+unique(data$brand)
+```
+
+```{r agg-by-brand}
+by_brand <- data %>% 
+  group_by(brand, date) %>% 
+  summarise_at(vars(sales_1:investment_6), sum, na.rm = TRUE) %>%
+  ungroup()
+
+# Save this dataset for later use
+write_rds(by_brand, file = file.path(path_data, "data_level_brand.rds"))
+
+
+by_brand <- by_brand %>% 
+  filter(date <= last_train)
+```
+
+Brand *Others* is the most significant at the sales level and the one with greatest
+dispersion. This can be for all the brands that it groups ([see re-coding
+brands](#recode-brands)). On the other hand, *Brand 41*, *Brand 30* and *Brand 36* are the
+ones with less dispersion.
+
+```{r viz-most-important-brand}
+by_brand %>% 
+  filter(date <= last_train) %>% 
+  ggplot(aes(x = fct_reorder(brand, sales_2), y = sales_2, fill = brand)) +
+  geom_boxplot() +
+  scale_y_continuous(
+    labels = scales::label_number(suffix = "K", scale = 1e-3)
+  ) +
+  scale_fill_brewer(palette = palette) +
+  coord_flip() +
+  theme(legend.position = "none") +
+  labs(x = NULL, y = NULL, colour = NULL, fill = NULL)
+```
+
+Below we can see that:
+
+-   Seven out of nine brands are in an uptrend. *Brand Group 41* and *Others* are the both
+    in a downtrend with similar trend structure.
+-   *Brand Group 17* and *Brand Group 24* present an exponential trend. Both brands starts
+    between 2015 and 2016.
+-   *Brand Group 30*, *Brand Group 31* and *Brand Group 51, 73, 90* are in an uptrend up
+    to some point in time and then it becomes to remain almost flat for the rest of the
+    time.
+-   Brand *Others* has dips in august, as does total sales.
+
+```{r viz-brands, echo=FALSE, fig.height=7, fig.width=8}
+plot_time_series(by_brand, x = date, y = sales_2, colour = brand) +
+  facet_wrap(~ brand, ncol = 3, scales = "free_y") +
+  labs(title = NULL)
+```
+
+## All levels
+
+The forecast is required at the Cluster - Brand level. Recall that initially 1184 SKU's
+have been provided and after the [aggregation of the series](#recode-brands) we end up
+with 75 SKU's.
+
+In this section we will be able to answer question such as: Do the same brand follow the
+same pattern despite they do not belong to the same cluster?
+
+```{r agg-at-forecat-level, echo = TRUE}
+all_levels <- data %>%
+  group_by(cluster, brand, date) %>%
+  summarise_at(vars(sales_1:investment_6), sum, na.rm = TRUE) %>%
+  ungroup()
+
+# Save this dataset for later use
+write_rds(all_levels, file = file.path(path_data, "data_level_sku.rds"))
+
+# Keep only with train data for better visualizations
+all_levels <- all_levels %>%
+  filter(date <= last_train)
+```
+
+With the following code we plot all the brands colored by cluster. However, we will only
+plot those cases that have remarkable features.
+
+```{r fig.height=6, fig.width=6, echo=TRUE, eval=FALSE}
+all_levels %>% 
+  plot_time_series(x = date, y = sales_2, colour = cluster) +
+  facet_wrap(~ brand, ncol = 3, scales = "fixed")
+```
+
+Some brands are more recent than others. *Brand Group 17* and *Brand Group 24* are
+examples of recent brands. where they began to be marketed from the beginning and end of
+2015 respectively.
+
+```{r viz-brands-1}
+all_levels %>% 
+  filter(brand %in% c("Brand Group 17", "Brand Group 24")) %>% 
+  plot_time_series(x = date, y = sales_2, colour = cluster) +
+  scale_fill_brewer(palette = palette) +
+  facet_wrap(~ brand, ncol = 2, scales = "fixed")
+```
+
+In the case of *Brand Group 41* we can see a lot of variability within clusters, having in
+some clusters values below 10k and in others above 25k. On the other hand, it is
+interesting to see how the same brand behaves in a similar way in very cluster. This
+indicate us that this could be a good way to train our models.
+
+```{r viz-brands-2}
+all_levels %>% 
+  filter(brand %in% c("Brand Group 41", "Brand Group 96, 97")) %>% 
+  plot_time_series(x = date, y = sales_2, colour = cluster) +
+  facet_wrap(~ brand, ncol = 2, scales = "fixed")
+```
+
+We can also analyze the contribution of each product in the portfolio. More than 75% of
+the products have a weight less than or equal to 2%, while the other 25% have a weight
+bigger than 2%. We can also see how around 12% (9 products) of the products have a weights
+greater than 4%. This suggests that we should put more focus into some products than
+others.
+
+```{r viz-ecdf-products}
+all_levels_wgts <- all_levels %>% 
+  group_by(cluster, brand) %>% 
+  summarise(weight = sum(sales_2)) %>% 
+  ungroup() %>% 
+  mutate(weight = weight / sum(weight)) %>% 
+  arrange(desc(weight))
+
+ggplot(all_levels_wgts, aes(weight)) +
+  
+  geom_vline(xintercept = 0.02, lty = 2, color = "grey50") +
+  geom_rect(
+    xmin = 0, xmax = 0.02, 
+    ymin = 0, ymax = Inf, 
+    fill = "lightgrey", 
+    alpha = 0.01
+  ) +
+  annotate(
+    geom = "label", x = 0, y = 1, 
+    label = "Products with \nweight <= 2%", 
+    hjust = -0.1, vjust = 1, 
+    size = 4
+  ) +
+  geom_vline(xintercept = 0.04, lty = 2, color = "grey50") +
+  geom_rect(
+    xmin = 0.04, xmax = Inf,
+    ymin = 0, ymax = Inf,
+    fill = "lightgrey",
+    alpha = 0.01
+  ) +
+  annotate(
+    geom = "label", x = 0.05, y = 0.6, 
+    label = "Products with weight >= 4%", 
+    hjust = 0, vjust = 1, 
+    size = 4
+  ) +
+  stat_ecdf(geom = "step") +
+  
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(x = "Weight", y = "Cumulative density")
+```
+
+Finally, we can visualize a tree map of the weights of each product. Notice how most
+important products belong to *Others* and *Brand Group 41*. Bigger squares and darker
+color means higher contribution to the portfolio.
+
+```{r all-levels-treemap-plot}
+pointFormatter <- JS("function(){
+  return '<b>Weight</b>: ' + this.w_text
+}")
+
+all_levels_wgts %>% 
+  slice_max(order_by = weight, n = 25) %>% 
+  mutate(
+    id = paste(cluster, brand, sep = "<br>"),
+    w_text = scales::percent(weight, accuracy = 0.01)
+  ) %>% 
+  hchart("treemap", 
+         hcaes(x = id, value = weight, color = weight), 
+         name = "Weight") %>% 
+  hc_tooltip(pointFormatter = pointFormatter) %>%
+  hc_legend(align = "right", valueDecimals = 0)
+```
+
+## Lagged sales
+
+Many times the impact of the immediate past sales is not representative of what will come
+next. Imagine that we want to predict the temperature that we will have in august in an
+specific country. It would make sense to look at the past Augusts and see what is the
+average temperature rather than looking at the temperature of April or June.
+
+On the x-axis is represented the lagged value of the sales and in the y-axis the real
+value. As closer the points are to the diagonal line better the correlation it is. Last
+year sales (12 months) seems a good predictor of current sales.
+
+```{r aux-function-create-lags}
+get_lags <- function(var, n = 3){
+  var <- enquo(var)
+  indices <- seq_len(n)
+  map(indices, ~ quo(lag(!!var, !!.x)) ) %>% 
+    set_names(sprintf("lag_%s_%02d", rlang::quo_text(var), indices))
+}
+```
+
+```{r add-sales_2-lags}
+total_sales_lags <- total_sales %>% 
+  transmute(sales_2, 
+    across(.cols = sales_2, .fns = get_lags(sales_2, 12), .names = "{fn}")
+  )
+
+plot_data <- total_sales_lags %>% 
+  select(
+    sales_2, lag_sales_2_03, lag_sales_2_03, lag_sales_2_09, 
+    lag_sales_2_12
+  ) %>% 
+  pivot_longer(
+    cols = contains("lag_"),
+    names_to = "lag_id",
+    values_to = "lag_value"
+  )
+```
+
+```{r viz-lagged-sales, fig.height=3.5, fig.width=8, echo=TRUE, message=FALSE, error=FALSE}
+plot_data %>% 
+  ggplot(aes(x = lag_value, y = sales_2)) +
+  geom_point(shape = 21, colour = "black", fill = "orange", size = 3) +
+  geom_smooth(method = lm, se = FALSE, colour = "black", lty = 2) +
+  scale_x_continuous(
+    labels = scales::label_number(suffix = "K", scale = 1e-3)
+  ) +
+  scale_y_continuous(
+    labels = scales::label_number(suffix = "K", scale = 1e-3)
+  ) +
+  facet_wrap(~ lag_id, ncol = 3, scales = "fixed")
+```
+
+# Investments
+
+Investments
+
+## Overall investments
+
+What is the most important investment type? In absolute terms, the most important
+investment are *investment_1* and *investment_2*.
+
+```{r}
+total_sales %>% 
+  select(-starts_with("sales")) %>% 
+  pivot_longer(
+    cols = starts_with("investment"), 
+    names_to = "investment", 
+    values_to = "value"
+  ) %>% 
+  ggplot(aes(x = investment, y = value)) +
+  geom_boxplot(show.legend = FALSE, fill = "gray", alpha = 0.7) +
+  scale_y_continuous(
+    labels = scales::label_number(suffix = "K", scale = 1e-3)
+  ) + 
+  labs(x = NULL, y = "Investment quantity")
+```
+
+## Sales vs Investments
+
+To see the relationships between sales and investments, we can plot each time series
+against the others. These plots can be arranged in a scatterplot matrix, using the
+`GGally` package.
+
+In this plot, mostly negative relationships with *sales_2* are revealed, with the
+strongest relationships being with *investment_1* and *investment_5* and the weakest with
+*investment_4*.
+
+-   *Investments 1*, *5* and 6 are highly correlated with *sales_2*
+-   *Investments 1*, 5and *6* are highly correlated between them. Be cautious when
+    modeling!
+-   *Investment 3* has an outlier on the left tail of the distribution.
+-   *Investment 4* does not have any effect over *sales_2*
+
+```{r ggpairs-investments, fig.width=8, fig.height=8}
+total_sales %>%
+  GGally::ggpairs(
+    columns = seq(from = 3, to = 9),
+    # title = "Sales vs Investments",
+    lower = list(
+      continuous = GGally::wrap(
+        "smooth", method = MASS::rlm, se = FALSE, shape = 21, 
+        colour = "black", fill = "orange", alpha = 0.6, 
+        size = 2)
+    )
+  ) +
+  scale_x_continuous(
+    labels = scales::label_number(suffix = "K", scale = 1e-3)
+  ) +
+  scale_y_continuous(
+    labels = scales::label_number(suffix = "K", scale = 1e-3)
+  ) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+```{r net-sales-vs-investments, fig.width=7, fig.height=8, echo=FALSE}
+# p1 <- total_sales %>% 
+#   select(date, sales_2, investment_1) %>% 
+#   mutate_if(is.numeric, scale) %>%
+#   plot_time_series(x = date, y = sales_2, y_second = investment_1) +
+#   labs(subtitle = "Sales vs Investment_1")
+# 
+# p2 <- total_sales %>% 
+#   select(date, sales_2, investment_2) %>% 
+#   mutate_if(is.numeric, scale) %>% 
+#   plot_time_series(x = date, y = sales_2, y_second = investment_2) +
+#   labs(subtitle = "Sales vs Investment_2")
+# 
+# p3 <- total_sales %>% 
+#   select(date, sales_2, investment_3) %>% 
+#   mutate_if(is.numeric, scale) %>% 
+#   plot_time_series(x = date, y = sales_2, y_second = investment_3) +
+#   labs(subtitle = "Sales vs Investment_3")
+# 
+# p4 <- total_sales %>% 
+#   select(date, sales_2, investment_4) %>% 
+#   mutate_if(is.numeric, scale) %>% 
+#   plot_time_series(x = date, y = sales_2, y_second = investment_4) +
+#   labs(subtitle = "Sales vs Investment_4")
+# 
+# p5 <- total_sales %>% 
+#   select(date, sales_2, investment_5) %>% 
+#   mutate_if(is.numeric, scale) %>% 
+#   plot_time_series(x = date, y = sales_2, y_second = investment_5) +
+#   labs(subtitle = "Sales vs Investment_5")
+# 
+# p6 <- total_sales %>% 
+#   select(date, sales_2, investment_6) %>% 
+#   mutate_if(is.numeric, scale) %>% 
+#   plot_time_series(x = date, y = sales_2, y_second = investment_6) +
+#   labs(subtitle = "Sales vs Investment_6")
+
+# (p1 / p2 / p3) | ( p4 / p5 / p6)
+```
+
+Three out of six investments have a negative trend, therefore, it indicates that more and
+more has been invested. Recall that investments are negative and lower investments means
+more investing.
+
+```{r, fig.width=8, fig.height=3}
+total_sales %>% 
+  select(date, sales_2, investment_1, investment_5, investment_6) %>% 
+  mutate_if(is.numeric, scale) %>% 
+  pivot_longer(cols = starts_with("investment")) %>% 
+  plot_time_series(x = date, y = sales_2, y_second = value) +
+  facet_wrap(~ name, scales = "fixed") +
+  scale_y_continuous()
+```
+
+On the other hand, there is another group of investments that are stationary, that is,
+they are moving around their mean. In addition, *investment_2* has annual seasonality,
+with spikes in august and September and valleys in December.
+
+In January of 2016 there is an outlier in the *investment_3*.
+
+```{r, fig.width=8, fig.height=3}
+total_sales %>% 
+  select(date, sales_2, investment_2, investment_3, investment_4) %>% 
+  mutate_if(is.numeric, scale) %>% 
+  pivot_longer(cols = starts_with("investment")) %>% 
+  plot_time_series(x = date, y = sales_2, y_second = value) +
+  facet_wrap(~ name, scales = "fixed") +
+  scale_y_continuous()
+```
+
+## Lagged Investments
+
+Sometimes, the impact of a predictor that is included in a regression model will not be
+simple and immediate. For example, an advertising campaign may impact sales for some time
+beyond the end of the campaign, and sales in one month will depend on the advertising
+expenditure in each of the past few months.
+
+```{r create-lags-investment1, echo=FALSE}
+# library(timetk)
+# 
+# lag_investment_1 <- total_sales %>%
+#   select(date, sales_2, investment_5) %>% 
+#   tk_tbl(rename_index = "date") %>%
+#   tk_augment_lags(
+#     .value = investment_5,
+#     .names = "auto",
+#     .lags = seq(1, 12)
+#   ) %>%
+#   pivot_longer(
+#     cols = contains("investment_5_lag"),
+#     names_to = "lag_id",
+#     values_to = "lag_value"
+#   )
+```
+
+```{r plot-lags-investment1, fig.width=7, fig.height=8, echo=FALSE}
+# library(ggpubr) # Needed for ggplot stat_cor()
+# 
+# lag_investment_1 %>%
+#   timetk::plot_time_series(
+#     .date_var = sales_2,
+#     .value = lag_value,
+#     .facet_vars = lag_id,
+#     .facet_ncol = 3,
+#     .interactive = FALSE,
+#     .smooth = FALSE,
+#     .line_alpha = 0,
+#     .legend_show = FALSE,
+#     .facet_scales = "fixed"
+#   ) +
+#   geom_point(aes(colour = lag_id)) +
+#   geom_abline(colour = "gray", linetype = "dashed") +
+#   geom_smooth(method = "lm", se = FALSE) +
+#   stat_cor(label.y.npc = 0.1) +
+#   # stat_regline_equation(label.y = -10) +
+#   theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+```

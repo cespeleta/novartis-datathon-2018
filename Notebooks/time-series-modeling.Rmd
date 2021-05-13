@@ -1,0 +1,1637 @@
+---
+title: "Time Series Modeling"
+author: "Carlos Espeleta"
+date: "`r Sys.Date()`"
+output: 
+  html_notebook: 
+    toc: yes
+    toc_depth: 2
+    toc_float:
+      collapsed: no
+      smooth_scroll: no
+    code_folding: none
+    theme: cosmo
+    highlight: tango
+    css: include/center.css
+    includes:
+      in_header: include/favicon.html
+editor_options: 
+  markdown: 
+    wrap: 90
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  warning = FALSE, message = FALSE, echo = FALSE, 
+  fig.width = 7, fig.align = "center", 
+  out.width = "95%", dpi = 72
+)
+```
+
+```{r load-libraries, echo=FALSE}
+# Load packages
+library(plotly)
+library(tidyverse)
+library(lubridate)
+library(patchwork)
+library(future)
+library(tsibble)
+library(fable)
+library(ggthemes)
+
+# Avoid message on summarize
+options(dplyr.summarise.inform = FALSE)
+
+# Set default theme settings
+theme_set(
+  theme_light() +
+    theme(legend.position = "bottom")
+)
+
+# English
+invisible(Sys.setlocale("LC_ALL", "English"))
+
+# Define paths directories
+path_data <- "../Data"
+path_models <- "../Models"
+
+# Define last train date
+last_train <- "2018-01-01"
+
+# Set TRUE to train models, otherwise set to FALSE.
+is_train_models <- FALSE
+```
+
+```{r knitr-table-aux}
+to_html <- function(df, digits = 2, ...) {
+  knitr::kable(df, format = "html", digits) %>% 
+    kableExtra::kable_styling(
+      bootstrap_options = c("striped", "hover", "condensed"),
+      ...
+    )
+}
+```
+
+```{r logo-novartis, echo=FALSE, out.width='100%'}
+knitr::include_graphics('../Images/logo-novartis.png')
+```
+
+# The Challenge {.unnumbered}
+
+Finance has the responsibility to forecast, plan and allocate resources in order to
+successfully deliver the best treatments to our patients.
+
+-   The **first** challenge consist of deliver sales forecast for 2018 per cluster, per
+    brand and per month.
+
+-   The **second** challenge is to provide the optimal allocation of their resources for
+    the year 2018.
+
+# Sales Forecasting
+
+The first problem deals with generating the forecasts of 75 time series. Each time series
+corresponds to the demand for a specific product (brand) in a geographic area (cluster).
+The time series are in monthly granularity.
+
+We have been provided with the demand history for each of the series, so that by training
+statistical models in the past, we should be able to model behaviors that are likely to be
+repeated in the future. Therefore, with time series models we should be able to tackle the
+problem.
+
+There are different techniques to tackle this problem, the "bottom-up" and the "top-down"
+approach.
+
+A simple method for generating coherent forecasts is the "bottom-up" approach. This
+approach involves first generating forecasts for each series at the bottom level, and then
+summing these to produce forecasts for all the higher level series. Other approaches are
+the "top-down" whose involve first generating forecasts for the total series, and then
+disaggregating these down to all the levels.
+
+The method chosen for this problem is the "bottom-up" approach because with this method we
+do not loss any information due to aggregations and because with only 75 series is a
+feasible approach.
+
+```{r load-data}
+all_levels <- read_rds(file.path(path_data, "data_level_sku.rds"))
+by_brand <- read_rds(file.path(path_data, "data_level_brand.rds"))
+```
+
+Recall how the data looks like
+
+```{r convert-to-tsibble}
+# Define `keys` and `index`
+key <- c("cluster", "brand")
+index <- "date"
+
+# Convert to a `tsibble` object
+all_levels_tbl <- all_levels %>% 
+  unite(id, !!key, sep = "__", remove = FALSE) %>% 
+  mutate(date = tsibble::yearmonth(!!sym(index))) %>%
+  as_tsibble(key = id, index = index)
+
+# Preview data
+tail(all_levels_tbl, 3) %>% 
+  to_html(digits = 1) %>% 
+  kableExtra::scroll_box(width = "100%")
+```
+
+<br>
+
+The training process will be divided into the following steps:
+
+1.  Define a list of models to use.
+2.  Train the models using the training data
+3.  Create the forecasts for the validation data
+4.  Evaluate the performance of the models
+
+## Evaluation metric
+
+The competition metric is the Mean Absolute Percentage Error (MAPE).
+
+$$
+MAPE = \frac{100}{h} \sum^{h}_{t=1}\frac{y_{t} - \hat{y}_{t} }{y_{t}}
+$$
+
+where $y_t$ is the actual value and $\hat{y}_t$ is the predicted value.
+
+Percentage errors have the advantage of being unit-free, and so are frequently used to
+compare forecast performances between data sets.
+
+Measures based on percentage errors have the disadvantage of being infinite or undefined
+if $y_t=0$ for any $t$ in the period of interest, and having extreme values if any $y_t$
+is close to zero. [Makridakis (1993)](http://dx.doi.org/10.1016/0169-2070%2893%2990079-3)
+said that "equal errors above the actual value result in a greater APE than those below
+the actual value". He provided an example where $y_t = 150$ and $\hat{y}_t = 100$, so that
+the relative error is $\frac{50}{150} = 0.33$, in contrast to the situation where
+$y_t = 100$ and $\hat{y}_t = 150$, when relative error would be $\frac{50}{100} = 0.5$.
+Thus, MAPE puts a heavier penalty on negative errors (when $y_t$ \< $\hat{y}_t$) than on
+positive errors.
+
+```{r define-eval-metric}
+mape_ <- function(y_true, y_pred) {
+  mean(abs( (y_true - y_pred) / y_true))
+}
+
+df_ <- crossing(
+  y_true = c(150, 100, 50), 
+  error = seq(from = -100, to = 100, length.out = 100)
+  ) %>% 
+  mutate(
+    y_pred = y_true + error,
+    metric_value = map2_dbl(y_true, y_pred, mape_)
+  )
+
+highlight_df <- df_ %>% 
+  group_by(y_true) %>% 
+  filter(metric_value == max(metric_value)) %>% 
+  slice_max(y_pred) %>% 
+  ungroup()
+
+ggplot(df_, aes(error, metric_value)) +
+  geom_hline(yintercept = 1, linetype = 2, alpha = 0.6, color = "gray50") +
+  geom_vline(xintercept = 100, linetype = 2, alpha = 0.6, color = "gray50") +
+  geom_line(aes(color = factor(y_true))) +
+  geom_point(data = highlight_df, color = "white", 
+             fill = "pink", size = 4.5, shape = 21, alpha = 0.7) +
+  scale_color_brewer(palette = "Dark2") +
+  scale_x_continuous(n.breaks = 9) +
+  scale_y_continuous(labels = scales:::percent) +
+  # theme_fivethirtyeight() +
+  theme(panel.grid.minor = element_blank()) +
+  labs(x = "Error in absolute terms", y = "MAPE", color = "Real value")
+```
+
+In the *x-axis* we have the absolute error and in the *y-axis* de MAPE. Absolute error are
+the number of units above or below the real value, i.e if the real value is 100 and the
+error is 50 then the predicted value has been 150. For the same error, as lower the true
+vale it is, the bigger the error we have.
+
+## Split data
+
+As we are dealing with monthly time series data we will split the series using time rather
+than randomly as we usually do when training machine learning models. We will keep apart
+the last year of the data.
+
+```{r split-data}
+# Train, validation and test evaluation
+first_date_submission <- yearmonth("2018-01-01")
+last_train <- first_date_submission - month(12)
+
+train_data <- all_levels_tbl %>% 
+  filter(date < yearmonth(last_train))
+
+valid_data <- all_levels_tbl %>% 
+  filter(date >= yearmonth(last_train), 
+         date < yearmonth(first_date_submission))
+
+test_data <- all_levels_tbl %>% 
+  filter(date >= yearmonth(first_date_submission))
+```
+
+The datasets will be as follows:
+
+```{r show-split-data-date-ranges}
+sprintf("Train data period: %s - %s", min(train_data$date), max(train_data$date))
+sprintf("Valid data period: %s - %s", min(valid_data$date), max(valid_data$date))
+sprintf("Test data period: %s - %s", min(test_data$date), max(test_data$date))
+```
+
+## Baseline models
+
+Before doing nothing, let's compute some statistical baselines for all the series, that
+is, statistical models that just repeat the last value (`NAIVE`) or the last period of
+samples (`SNAIVE`).
+
+```{r start-parallelization, echo=FALSE}
+# # Not supported on Windows.
+# my_plan <- future::plan("multicore", workers = 4L)
+# future::resetWorkers(my_plan)
+
+# I think this works on windows
+my_plan <- future::plan("multisession", workers = 4L)
+# future::plan("sequential")
+```
+
+The models that we are going to use as a benchmarks are:
+
+-   `NAIVE`: this model replicate the last value of the sales data. This model is
+    equivalent to an $ARIMA(0,1,0)$ model.
+
+-   `SNAIVE`: this model replicates the last period of samples from train data. This model
+    is equivalent to an $ARIMA(0,0,0)(0,1,0)_m$ model, where *m* is the seasonal period (m
+    = 12 in monthly data.)
+
+```{r baseline-definition, echo=TRUE}
+# Baseline models
+models <- list(
+  naive    = NAIVE(sales_2),
+  snaive_1 = SNAIVE(sales_2 ~ lag("year") ),
+  snaive_2 = SNAIVE(sales_2 ~ lag("year") + drift() )
+)
+```
+
+Fit baseline models
+
+```{r baseline-forecast, echo=TRUE}
+fit_baselines <- train_data %>% 
+  model(!!!models)
+```
+
+Generate forecast for all the models. Three different forecast will be generated for each
+serie.
+
+```{r baseline-validation-forecast, echo=TRUE}
+fc_baselines <- fit_baselines %>% 
+  forecast(new_data = valid_data)
+```
+
+The metric that we will use to evaluate the performance of each model is the *MAPE* but I
+will also include the *RMSSE* and *CRPS* for completeness. For both, the *RMSE* and the
+*MAPE,* the smaller the better.
+
+The best model has been the `naive` with a *MAPE* of 26.9, followed by the two variants of
+the `snaive`. An error of a *MAPE* of 26.9 means that the model has an error of 26.9%.
+
+```{r forecat-aux-functions}
+# Define the metrics that we want to use when 
+# evaluating the forecasts
+measures <- list(RMSSE = RMSSE, MAPE = MAPE, CRPS = CRPS)
+
+# Function to rank the models based on a matric
+add_rank <- function(.data, var = NULL) {
+  var <- sym(var)
+  .data %>% 
+    group_by(id) %>% 
+    mutate(rank = dense_rank(!!var)) %>% 
+    ungroup() %>% 
+    arrange(id, !!var)
+}
+```
+
+```{r baseline-accuracy}
+# Calculate accuracy for each series and model
+acc_baselines <- fc_baselines %>% 
+  accuracy(bind_rows(train_data, valid_data), measures) %>% 
+  add_rank(var = "MAPE")
+
+# Aggregate metrics by `.model`
+acc_baselines %>% 
+  group_by(.model) %>% 
+  summarise_at(vars(RMSSE:CRPS), mean) %>% 
+  arrange(MAPE) %>% 
+  to_html(digits = 1, full_width = TRUE)
+```
+
+```{r}
+# # Buscamos diferencias entre modelos para mostrarlo en visualizaciones
+# acc_baselines %>% 
+#   pivot_wider(id_cols = id, names_from = .model, values_from = MAPE) %>% 
+#   mutate(
+#     diff_1 = abs(naive - snaive_1),
+#     diff_2 = abs(snaive_1 - snaive_2)
+#   ) %>% 
+#   arrange(desc(diff_2)) %>% 
+#   head()
+```
+
+Now that we have the forecast and we know what has been the best model, let's visualize
+the forecast to get insight into the data.
+
+```{r aux-function-viz-forecasts}
+plot_forecast <- 
+  function(fc, data = bind_rows(train_data, valid_data), 
+           facets = NULL, level = 80, ncol = NULL, scales = "fixed", 
+           title = NULL) {
+    
+    if (is.null(title)) {
+      title <- sprintf("Forecast ID: %s", fc$id[[1]])
+    }
+    
+    gg <- fc %>% 
+      autoplot(data, level = level, size = 0.8) +
+      # guides(colour = FALSE) +
+      scale_y_continuous(
+        labels = scales::label_number(suffix = "K", scale = 1e-3)
+      ) +
+      labs(subtitle = title, x = NULL, y = NULL, colour = "Model") +
+      theme(legend.position = "bottom") +
+      ggthemes::scale_color_tableau(palette = "Classic 10 Medium")
+    
+    if (!is.null(ncol)) {
+      gg <- gg + 
+        facet_wrap(facets, ncol = ncol, scales = scales)
+    }
+    gg
+}
+```
+
+Although the `snaive` model has performed better overall, in some series it performs worse
+than the `snaive`.
+
+```{r viz-baseline-diff-naive}
+# Better snaive than naive
+fc_baselines %>% 
+  filter(id == "Cluster 7__Brand Group 30") %>%
+  plot_forecast(facets = ".model", ncol = NULL, level = NULL, title = "") +
+  facet_wrap(~ id)
+```
+
+We also find differences between the `snaive` models. In the following plot we can see how
+the `snaive` with drift is under-forecasting while the other, without drift, is providing
+an acceptable forecast.
+
+```{r viz-baseline-diff-snaive}
+fc_baselines %>% 
+  filter(id == "Cluster 2__Others", 
+         .model %in% c("snaive_1", "snaive_2")) %>%
+  plot_forecast(facets = ".model", ncol = NULL, level = NULL, title = "") +
+  facet_wrap(~ id)
+```
+
+Sometimes no model is good.
+
+```{r viz-naive-all-wrong}
+fc_baselines %>% 
+  filter(id == "Cluster 5__Brand Group 30") %>%
+  plot_forecast(facets = ".model", ncol = NULL, level = NULL, title = "") +
+  facet_wrap(~ id)
+```
+
+## Statistical Benchmarks {#statistical-benchmarks}
+
+Exponential smoothing and ARIMA models are the two most widely used approaches to time
+series forecasting, and provide complementary approaches to the problem. While exponential
+smoothing models are based on a description of the trend and seasonality in the data,
+ARIMA models aim to describe the autocorrelations in the data.
+
+-   `ARIMA`: autoregressive integrated moving average model
+-   `ETS`: exponential smoothing models are based on a description of the trend and
+    seasonality in the data
+
+When there are long seasonal periods, a dynamic regression with fourier terms is often
+better than `ARIMA` and `ETS` models.
+
+For example, daily data can have annual seasonality of length 365, weekly data has
+seasonal period of approximately 52, while half-hourly data can have several seasonal
+periods, the shortest of which is the daily pattern of period 48.
+
+Despite we do not have long seasonal periods here, this models will be included in our
+list of models.
+
+-   `FOURIER`: Linear regression model with errors modeled with an arima model to remove
+    the autocorrelation.
+
+Additionally to this models, it has also been included a combination forecast of `ARIMA`
+and `ETS` models which has been called `combn`.
+
+```{r statistical-definition, echo=TRUE}
+models_stat <- list(
+  # Statistical benchmarks
+  arima = ARIMA(sales_2),
+  ets   = ETS(sales_2),
+  
+  # Using Fourier terms and ARIMA errors for forecasting
+  `K = 1` = ARIMA(sales_2 ~ fourier(K = 1) + PDQ(0, 0, 0)),
+  `K = 2` = ARIMA(sales_2 ~ fourier(K = 2) + PDQ(0, 0, 0)),
+  `K = 3` = ARIMA(sales_2 ~ fourier(K = 3) + PDQ(0, 0, 0)),
+  `K = 4` = ARIMA(sales_2 ~ fourier(K = 4) + PDQ(0, 0, 0)),
+  `K = 5` = ARIMA(sales_2 ~ fourier(K = 5) + PDQ(0, 0, 0)),
+  `K = 6` = ARIMA(sales_2 ~ fourier(K = 6) + PDQ(0, 0, 0))
+)
+```
+
+```{r fit-statistical-models, eval=is_train_models}
+# Train models
+fit_statistical <- train_data %>% 
+  model(!!!models_stat) %>% 
+  mutate(combn = (arima + ets) / 2)
+
+# Save models
+write_rds(fit_statistical, 
+  file.path(path_models, "fit_statistical.rds"), 
+  compress = "gz")
+
+# Generate forecasts for the validation period
+fc_statistical <- fit_statistical %>% 
+  forecast(new_data = valid_data)
+
+# Save forecasts
+write_rds(fc_statistical, 
+  file.path(path_models, "fc_statistical.rds"), 
+  compress = "gz")
+```
+
+```{r statistical-forecast-generation}
+# Load models
+fit_statistical <- read_rds(file.path(path_models, "fit_statistical.rds"))
+
+# Load forecasts
+fc_statistical <- read_rds(file.path(path_models, "fc_statistical.rds"))
+
+# Calculate accuracy for each series and model
+acc_statistical <- fc_statistical %>% 
+  accuracy(bind_rows(train_data, valid_data), measures) %>% 
+  add_rank(var = "MAPE")
+```
+
+The best model is the `combn`, followed by the `ARIMA` and the `K = 2` models. The error
+has been reduced by 26.4% with respect to the `naive` model.
+
+```{r model-reduction-percentage, echo=FALSE, eval=FALSE}
+nn <- 26.9    # naive model
+cc <- 19.8    # combn model
+(cc / nn) - 1 # reduction percentage
+# [1] -0.2639405
+```
+
+```{r statistical-accuracy}
+# Aggregate metrics by `.model`
+acc_statistical %>% 
+  group_by(.model) %>% 
+  summarise_at(vars(RMSSE:CRPS), mean) %>% 
+  arrange(MAPE) %>% 
+  head(6) %>% 
+  to_html(digits = 1)
+```
+
+```{r}
+# # Does all the brands perform equally? Is always the same model the best performer?
+# acc_statistical %>% 
+#   separate(id, into = c("cluster", "brand"), sep = "__") %>% 
+#   group_by(brand, .model) %>% 
+#   summarise_at(vars(RMSSE:CRPS), mean) %>% 
+#   arrange(MAPE) %>% 
+#   slice(1) %>% 
+#   to_html(digits = 1)
+```
+
+In the example below, neither model has generated a good forecast, in fact, it seems that
+the `ets` model only has captured the trend.
+
+```{r viz-stat-forecast-01}
+fc_statistical %>%
+  filter(
+    id == "Cluster 7__Brand Group 30",
+    .model %in% c("arima", "ets")
+  ) %>%
+  plot_forecast(facets = ".model", ncol = NULL, level = NULL, title = "") +
+  facet_wrap(~ id)
+```
+
+In this other case, both forecasts are similar to each other and the `snaive_1`
+
+```{r viz-stat-forecast-02}
+fc_statistical %>% 
+  filter(
+    id == "Cluster 2__Others", 
+    .model %in% c("ets", "arima")
+  ) %>%
+  plot_forecast(facets = ".model", ncol = NULL, level = NULL, title = "") +
+  facet_wrap(~ id)
+```
+
+Again, none of the models has been able to capture the big drop off of 2017.
+
+```{r viz-statistical-all-wrong}
+fc_statistical %>% 
+  filter(
+    id == "Cluster 5__Brand Group 30"
+  ) %>%
+  plot_forecast(facets = ".model", ncol = NULL, level = NULL, title = "") +
+  facet_wrap(~ id)
+```
+
+## External Information
+
+The time series models used so far allow for the inclusion of information from past
+observations of a series, but not for the inclusion of other information that may also be
+relevant. For example, the effects of the investments may explain some of the historical
+variation and may lead to more accurate forecasts
+
+```{r xreg-definition, echo=TRUE}
+# Using investments as predictors
+models_xreg <- list(
+  xreg_1 = ARIMA(sales_2 ~ investment_1),
+  xreg_2 = ARIMA(sales_2 ~ investment_1 + investment_2),
+  xreg_3 = ARIMA(sales_2 ~ investment_1 + investment_2 + investment_3),
+  xreg_4 = ARIMA(sales_2 ~ investment_1 + investment_2 + investment_3 + 
+                   investment_4 + investment_5 + investment_6)
+)
+```
+
+```{r train-models-xreg, eval=is_train_models}
+# Train models
+fit_xreg_ <- train_data %>% 
+  model(!!!models_xreg)
+
+# Append ARIMA models as default in case of failure
+# Replace NULL models by a `default` model
+fit_xreg <- fit_xreg_ %>% 
+  left_join(
+    select(fit_statistical, id, default = arima), 
+    by = "id"
+  ) %>% 
+  mutate(across(contains("xreg"), ~ if_else(is_null_model(.x), default, .x) )) %>% 
+  # Drop default model
+  select(-default)
+
+# Save models
+write_rds(fit_xreg, 
+  file.path(path_models, "fit_xreg.rds"), 
+  compress = "gz")
+
+# Generate forecasts for the validation period
+fc_xreg <- fit_xreg %>% 
+  forecast(new_data = valid_data)
+
+# Save forecasts
+write_rds(fc_xreg, 
+  file.path(path_models, "fc_xreg.rds"), 
+  compress = "gz")
+```
+
+```{r load-xreg-models}
+# Load models
+fit_xreg <- read_rds(file.path(path_models, "fit_xreg.rds"))
+
+# Load forecasts
+fc_xreg <- read_rds(file.path(path_models, "fc_xreg.rds"))
+
+# Calculate accuracy for each series and model
+acc_xreg <- fc_xreg %>% 
+  accuracy(bind_rows(train_data, valid_data), measures) %>% 
+  add_rank(var = "MAPE")
+```
+
+Overall accuracy is not as good as `combn`, `arima` or`ets` models trained on [statistical
+benchmarks](#statistical-benchmarks) section.
+
+```{r acc-xreg-models}
+# Aggregate metrics by `.model`
+acc_xreg %>% 
+  group_by(.model) %>% 
+  summarise_at(vars(RMSSE:CRPS), mean) %>% 
+  arrange(MAPE) %>% 
+  to_html(digits = 1)
+```
+
+Model `K = 4` overfit the data and generate a forecast in the opposite direction. In
+contrast, the `K = 2` is able to capture a more general pattern. This is a good example
+that more complex models do not always indicate better results.
+
+```{r viz-xreg-models-01}
+fc_xreg %>%
+  filter(
+    id == "Cluster 7__Brand Group 30",
+    .model %in% c("xreg_2", "xreg_4")
+  ) %>%
+  plot_forecast(facets = ".model", ncol = NULL, level = NULL, title = "") +
+  labs(title = NULL) +
+  facet_wrap(~ id)
+```
+
+All the forecasts are quite similar in this case
+
+```{r viz-xreg-models-02}
+fc_xreg %>% 
+  filter(id == "Cluster 2__Others") %>%
+  plot_forecast(facets = ".model", ncol = NULL, level = NULL, title = "") +
+  facet_wrap(~ id)
+```
+
+Apparently, the investments neither explain the drop off of 2017.
+
+```{r viz-xreg-models-03}
+fc_xreg %>% 
+  filter(id == "Cluster 5__Brand Group 30") %>%
+  plot_forecast(facets = ".model", ncol = NULL, level = NULL, title = "") +
+  facet_wrap(~ id)
+```
+
+For cases like this, we are going to introduce a new set of models that will help us to
+improve this structural changes.
+
+```{r future-plan-sequential}
+future::plan("sequential")
+```
+
+## Piecewise regression
+
+We have seen that, in some cases, the trend is not linear and the models are not able to
+model the series correctly. Piece-wise models divide the series into several segments in
+such a way that they are able to detect the trend correctly.
+
+### Brand analysis
+
+Performing the analysis for each series is a complicated and time-consuming task. For this
+reason, many times higher levels of aggregation are analyzed and then these conditions or
+parameters are applied to lower levels series.
+
+```{r brand-tibble-to-tsibble}
+by_brand_tsibble <- by_brand %>% 
+  filter(date < as.Date(last_train)) %>% 
+  mutate(date = tsibble::yearmonth(!!sym(index))) %>%
+  as_tsibble(key = brand, index = date)
+```
+
+The plot of the *Brand Group 31* reveals two different periods. There is a clear uptrend
+up to the end of 2015. After 2015 there is a decrease in the growing speed and the trend
+slow down a bit. To account for these changes, we specify the date *2015-01* as knots.
+
+```{r fit-model-brand-31, echo=TRUE}
+# Select a brand a fit a model
+current_brand <- "Brand Group 31"
+
+# Fit simple `lm` and `piecewise` model
+fit_trends <- by_brand_tsibble %>% 
+  filter(brand == current_brand) %>% 
+  model(
+    lm = TSLM(sales_2 ~ trend()),
+    piecewise = TSLM(sales_2 ~ trend(
+      knots = tsibble::yearmonth("2015-01")))
+  )
+```
+
+```{r viz-tslm-trend}
+fc_trends <- fit_trends %>% 
+  forecast(h = 12)
+
+fit_trends %>% 
+  augment() %>% 
+  ggplot(aes(x = date)) +
+  geom_line(aes(y = sales_2), colour = "black") +
+  geom_line(aes(y = .fitted, colour = .model), size = 1) +
+  scale_color_brewer(palette = "Set2", direction = -1) +
+  scale_y_continuous(
+    labels = scales::label_number(suffix = "K", scale = 1e-3)
+  ) +
+  autolayer(fc_trends, alpha = 0.3, level = 90) +
+  labs(
+    x = NULL, y = NULL,
+    title = "Original values and fitted trend", 
+    subtitle = current_brand
+  )
+```
+
+In the plot below the relationship between the real and adjusted values by the model is
+shown. The slashed line represents the perfection, in such a way that the further the
+points are from the line, the worse the model is. In the lower left corner, the values of
+the `piecewise` model are much better adjusted to the reality while those of the `lm` are
+farther away. In general, there is a bigger dispersion in the `lm` model than in the
+`piecewise`.
+
+```{r fitted-vs-real-values}
+fit_trends %>% 
+  augment() %>% 
+  ggplot(aes(x = sales_2, y = .fitted)) +
+  geom_point(aes(fill = .model), shape = 21, size = 2) +
+  scale_x_continuous(
+    labels = scales::label_number(suffix = "K", scale = 1e-3)
+  ) +
+  scale_y_continuous(
+    labels = scales::label_number(suffix = "K", scale = 1e-3)
+  ) +
+  scale_fill_brewer(palette = "Set2", direction = -1) +
+  geom_abline(intercept = 0, slope = 1, linetype = 2) +
+  labs(
+    x = "Data (original sales)", 
+    y = "Fitted (predicted values)",
+    title = "Original values and fitted trend", 
+    subtitle = current_brand
+  )
+```
+
+```{r piecewise-model-definition}
+get_models <- function(brand) {
+  
+  # Define step-wise models
+  mdl <- null_model()
+  if (brand == "Brand Group 17") {
+    mdl  <- TSLM(sales_2 ~ trend(knots = tsibble::yearmonth("2015-03")) + season())
+  } else if (brand == "Brand Group 24") {
+    mdl  <- TSLM(sales_2 ~ trend(knots = tsibble::yearmonth("2015-10")) + season())
+  } else if (brand == "Brand Group 30") {
+    mdl  <- TSLM(sales_2 ~ trend(
+      knots = c(tsibble::yearmonth("2013-07"), tsibble::yearmonth("2016-01"))
+      ) + season() )
+  } else if (brand == "Brand Group 31") {
+    mdl  <- TSLM(sales_2 ~ trend(knots = tsibble::yearmonth("2015-01")) + season())
+  } else if (brand == "Brand Group 36") {
+    mdl  <- TSLM(sales_2 ~ trend(knots = tsibble::yearmonth("2015-01")) + season())
+  } else if (brand == "Brand Group 41") {
+    mdl  <- TSLM(sales_2 ~ trend(knots = tsibble::yearmonth("2015-11")) + season())
+  } else if (brand == "Brand Group 51, 73, 90") {
+    mdl  <- TSLM(sales_2 ~ trend(knots = tsibble::yearmonth("2015-07")) + season())
+  } else if (brand == "Brand Group 96, 97") {
+    mdl  <- TSLM(sales_2 ~ trend(knots = tsibble::yearmonth("2017-01")) + season())
+  } else if (brand == "Others") {
+    mdl  <- TSLM(sales_2 ~ trend(knots = tsibble::yearmonth("2016-01")) + season())
+  }
+  
+  # Prepare a list of models
+  mdl_list <- list(
+    lm = TSLM(sales_2 ~ trend() + season()),
+    stepwise = mdl
+  )
+  
+  # Return list
+  return(mdl_list)
+}
+```
+
+The models are defined manually for each brand.
+
+```{r piecewise-model-definition-example, echo=TRUE, eval=FALSE}
+get_models_ <- function(brand) {
+  # Define step-wise models
+  mdl <- null_model()
+  if (brand == "Brand Group 17") {
+    mdl  <- TSLM(sales_2 ~ trend(knots = tsibble::yearmonth("2015-03")) + season())
+  } else if (brand == "Brand Group 24") {
+    ...
+  }
+}
+```
+
+In brands such as *Brand Group 17* or *Brand Group 24* the effect is remarkable. It is
+also in others, such as the *Brand Group 31* as we have just seen in the previous plots.
+
+```{r fit-stepwise-by-brand}
+# Fit models for all brand
+brands <- unique(train_data$brand) # all_levels_tbl
+fit_stepwise_brands <- map_df(
+  .x = brands, 
+  .f = ~ by_brand_tsibble %>% 
+    filter(brand == .x) %>% 
+    model(!!!get_models(.x) )
+)
+```
+
+```{r viz-stepwise-brands, fig.height=7, fig.width=9}
+p1 <- fit_stepwise_brands %>% 
+  filter(brand %in% c("Brand Group 17", "Brand Group 24")) %>% 
+  select(brand, lm, stepwise) %>% 
+  forecast(new_data = by_brand_tsibble) %>% 
+  autoplot(by_brand_tsibble, level = NULL, alpha = 0.9, size = 1) +
+  scale_color_brewer(palette = "Set2", direction = -1) +
+  scale_y_continuous(
+    labels = scales::label_number(suffix = "K", scale = 1e-3)
+  ) + 
+  scale_fill_brewer(palette = "Set2", direction = -1) +
+  labs(x = NULL, y = NULL)
+
+p2 <- fit_stepwise_brands %>% 
+  filter(brand %in% c("Brand Group 30", "Brand Group 31")) %>% 
+  select(brand, lm, stepwise) %>% 
+  forecast(new_data = by_brand_tsibble) %>% 
+  autoplot(by_brand_tsibble, level = NULL, alpha = 0.9, size = 1) +
+  scale_color_brewer(palette = "Set2", direction = -1) +
+  scale_y_continuous(
+    labels = scales::label_number(suffix = "K", scale = 1e-3)
+  ) + 
+  scale_fill_brewer(palette = "Set2", direction = -1) +
+  labs(x = NULL, y = NULL)
+
+(p1 | p2) + plot_layout(guides = "collect")
+```
+
+### All series analysis
+
+Now that we have identified the *knots* of each brand is time to apply this models into
+the product level series.
+
+```{r fit-stepwise-on-sku-level, echo=TRUE}
+fit_stepwise <- map_dfr(
+  .x = setNames(brands, brands), 
+  .f = ~ train_data %>% 
+    filter(brand == .x) %>% 
+    model(!!!get_models(.x)["stepwise"]), 
+  .id = "brand"
+)
+```
+
+Overall accuracy is not as good as `combn`, `arima` or`ets` models trained on [statistical
+benchmarks section](#statistical-benchmarks)
+
+```{r fc-and-acc-stepwise}
+# Generate forecasts for the validation period
+fc_stepwise <- fit_stepwise %>% 
+  forecast(new_data = valid_data)
+
+# Calculate accuracy for each series and model
+acc_stepwise <- fc_stepwise %>% 
+  accuracy(bind_rows(train_data, valid_data), measures) %>% 
+  add_rank(var = "MAPE")
+
+# Aggregate metrics by `.model`
+acc_stepwise %>% 
+  group_by(.model) %>% 
+  summarise_at(vars(RMSSE:CRPS), mean) %>% 
+  arrange(MAPE) %>% 
+  to_html(digits = 1)
+```
+
+Let's look at some of the worst forecast. The `arima` and `ets` models will be included as
+a reference. In that way, we can understand how the `piecewise` model is modeling the
+data. In the following case, it seems that the model has failed to capture the trend
+correctly and is under-forecasting much more than the other two models.
+
+```{r piecewise-worst-forecasts, eval=FALSE}
+# # Inspeccionamos las peores series
+# acc_stepwise %>% 
+#   arrange(desc(MAPE)) %>% 
+#   head()
+```
+
+```{r viz-piecewise-worst-forecasts}
+fc_stepwise %>%
+  bind_rows(fc_statistical) %>% 
+  filter(
+    id %in% c("Cluster 9__Brand Group 30"), 
+    .model %in% c("arima", "ets", "stepwise")
+  ) %>% 
+  autoplot(bind_rows(train_data, valid_data), level = NULL, alpha = 0.9) +
+  facet_wrap(vars(id)) +
+  labs(x = NULL, y = NULL)
+```
+
+What we can do now? Let's plot the trend to understand why this is happening. The model
+fits very well the trend up to 2016 but, after that period, the trend is still in a
+downtrend and it should remain almost flat. The vertical dashed lines indicate the *knots*
+defined within the model.
+
+```{r}
+# Fit trend model because we want to see how is trend captured
+fit_trend_30 <- train_data %>% 
+  filter(id %in% c("Cluster 9__Brand Group 30")) %>% 
+  model(
+    piecewise = TSLM(sales_2 ~ trend(
+      knots = c(tsibble::yearmonth("2013-07"), 
+                tsibble::yearmonth("2016-01"))))
+  )
+
+# Forecast trend model
+fc_trend_30 <- fit_trend_30 %>% 
+  forecast(h = 12)
+
+# Display real vs fitted data and forecasted trend
+fit_trend_30 %>% 
+  augment() %>% 
+  ggplot(aes(x = date)) +
+  geom_line(aes(y = sales_2), colour = "black", series = "Data") +
+  geom_line(aes(y = .fitted), colour = "steelblue", series = ".fitted") +
+  autolayer(fc_trend_30, colour = "steelblue", alpha = 0.3, level = 90) +
+  geom_vline(xintercept = c(as.Date("2013-07-01"), as.Date("2016-01-01")), 
+             linetype = 2, size = 1, color = "grey", alpha = 0.4) +
+  labs(
+    x = NULL,
+    y = "Data vs Fitted (predicted values)",
+    title = "Trend captured by the piecewise model", 
+    subtitle = "Cluster 9__Brand Group 30"
+  )
+```
+
+Finally, we show the forecast for the series that we have been looking in the previous
+sections.
+
+```{r viz-stepwise-02}
+fit_stepwise %>%
+  filter(id == "Cluster 7__Brand Group 30") %>%
+  left_join(select(fit_statistical, id, ets, arima), by = "id") %>% 
+  forecast(new_data = valid_data) %>% 
+  plot_forecast(facets = ".model", ncol = NULL, level = NULL, title = "") +
+  facet_wrap(~ id)
+```
+
+```{r viz-stepwise-01, echo=TRUE}
+fit_stepwise %>% 
+  filter(id == "Cluster 2__Others") %>%
+  left_join(select(fit_statistical, id, ets, arima), by = "id") %>% 
+  forecast(new_data = valid_data) %>% 
+  plot_forecast(facets = ".model", ncol = NULL, level = NULL, title = "") +
+  facet_wrap(~ id)
+```
+
+## Selecting best model
+
+Throughout the notebook we have seen how each model is better suited to one specific case,
+in some cases a model as simple as the `naive` give us the best results, however, in other
+cases we need more complex models to capture the signal of the series. So, why not select
+the best model for each series instead of always using the same model for everything?
+
+```{r accuracy-all-models, echo=TRUE}
+# Combine all accuracies together
+acc_all <- 
+  bind_rows(acc_baselines, acc_statistical, acc_xreg, acc_stepwise) %>% 
+  add_rank(var = "MAPE")
+
+# Select best model for each serie
+acc_best_models <- acc_all %>% 
+  arrange(id, rank) %>% 
+  top_n(-rank, n = 1) %>% 
+  dplyr::group_by(id) %>% 
+  dplyr::slice(1) %>% 
+  ungroup()
+```
+
+The error has been reduced by an 47% with respect to the `naive` and 28% with respect to
+the `combn` model.
+
+```{r eval=FALSE}
+# nn <- 26.9    # naive model
+# cc <- 14.1    # best model for each serie
+# (cc / nn) - 1 # reduction percentage
+# # [1] 0.4758364
+# 
+# nn <- 19.8    # combn model
+# cc <- 14.1    # best model for each serie
+# (cc / nn) - 1 # reduction percentage
+# # -0.2878788
+```
+
+```{r accuracy-summary-best-model, echo=TRUE}
+acc_best_models %>% 
+  summarise_at(vars(RMSSE:CRPS), mean) %>% 
+  add_column(.model = "Best model", .before = 1) %>% 
+  arrange(MAPE) %>% 
+  to_html(digits = 1)
+```
+
+```{r safety-check-model-ties}
+# # Safety check: do not exist duplicates in case of ties.
+# best_models %>% 
+#   count(id, sort = T)
+```
+
+How many times each model has been selected? `stepwise` and `arima` are the two best models
+followed by `xreg_4`. Recall that this model uses all the investments provided.
+
+```{r time-each-model-selected, fig.height=5}
+acc_best_models %>% 
+  count(.model, sort = TRUE) %>% 
+  ggplot(aes(x = fct_reorder(.model, n), y = n)) +
+  geom_col(fill = "#729ECE", alpha = 0.9) +
+  scale_y_continuous(n.breaks = 10) +
+  labs(
+    title = "How many times each model has been selected?", 
+    x = "", y = "Count"
+  ) +
+  coord_flip() +
+  theme(
+    panel.grid.major.y = element_blank(), 
+    panel.grid.minor = element_blank()
+  )
+```
+
+In the same way that we have been doing, we are going to show the best and worst
+predictions to get an idea of what the predictions are like.
+
+```{r forecast-all-models, echo=TRUE}
+# Combine all forecasts
+fc_all_models <- bind_rows(fc_baselines, fc_statistical, fc_xreg, fc_stepwise)
+
+fc_best_models <- fc_all_models %>% 
+  semi_join(acc_best_models, by = c(".model", "id"))
+```
+
+```{r best-models-best-forecasts, fig.height=7, fig.width=9}
+top_n_forecasts <- acc_best_models %>% 
+  arrange(MAPE) %>% 
+  head(4)
+
+fc_best_models %>% 
+  filter(id %in% top_n_forecasts$id) %>% 
+  plot_forecast(facets = "id", level = NULL, ncol = 2, scales = "free_y", 
+                title = "Best performing forecast")
+  # labs(title = "Best performing forecast")
+```
+
+Sometimes, any model is able to predict the data accurately. Might be, because the series
+are white noise or the signal-to-noise ratio is very low. Other times, there are very
+abrupt changes that cannot be explained by any predictor (past sales, investments, etc.)
+
+```{r best-models-worst-forecasts, fig.height=7, fig.width=9}
+worst_4_forecasts <- acc_best_models %>% 
+  arrange(MAPE) %>% 
+  tail(4)
+
+fc_best_models %>% 
+  filter(id %in% worst_4_forecasts$id) %>% 
+  plot_forecast(facets = "id", level = NULL, ncol = 2, scales = "free_y", 
+                title = "Worst performing forecast")
+  # labs(title = "Worst performing forecast")
+```
+
+### Drill down accuracy
+
+Forecasts are often required for all levels of the series, and it is natural that the
+forecasts to add up in the same way as the data. This is important because the forecast
+will be analyzed from different points of view and all of them must be aligned. For
+example, a brand manager might be interested in the forecast of all of their products but
+it also would might get a view at country level of their brand. At the same time, the CEO
+of the company, might be interested in higher levels of aggregation.
+
+The easiest brand to forecast is *Brand Group 96, 97* and the hardest is *Brand Group 24*
+which is not a surprise given it's highest growth.
+
+```{r accuracy-summary-best-model-brand-level}
+acc_best_models %>% 
+  separate(col = "id", into = c("cluster", "brand"), sep = "__") %>% 
+  group_by(brand) %>% 
+  summarise_at(vars(RMSSE:CRPS), median) %>% 
+  add_column(.model = "Best model", .before = 1) %>% 
+  arrange(MAPE) %>% 
+  to_html(digits = 1, full_width = FALSE)
+```
+
+In the same way, the easiest cluster is *Cluster 8* and the hardest is *Cluster 7*
+
+```{r accuracy-summary-best-model-cluster-level}
+acc_best_models %>% 
+  separate(col = "id", into = c("cluster", "brand"), sep = "__") %>% 
+  group_by(cluster) %>% 
+  summarise_at(vars(RMSSE:CRPS), median) %>% 
+  add_column(.model = "Best model", .before = 1) %>% 
+  arrange(MAPE) %>% 
+  to_html(digits = 1, full_width = FALSE)
+```
+
+## Make forecasts
+
+The last step is generate the forecast for all the 75 series. Now, we must estimate the
+models again but using all the data available.
+
+```{r start-parallelization-again}
+# # Start parallelization again
+# my_plan <- future::plan("multisession", workers = 2L)
+```
+
+```{r refit-models, echo=TRUE, eval=FALSE}
+# Combine all three list of models
+models_list <- c(models, models_stat, models_xreg)
+
+# Fit models using all train data
+fit_all_models_1 <- train_data %>%
+  bind_rows(valid_data) %>%
+  model(!!!models_list) %>%
+  mutate(combn = (arima + ets) / 2)
+
+# Train piece-wise models
+fit_all_models_2 <- map_dfr(
+  .x = setNames(brands, brands),
+  .f = ~ train_data %>%
+    bind_rows(valid_data) %>%
+    filter(brand == .x) %>%
+    model(!!!get_models(.x)["stepwise"]),
+  .id = "brand"
+)
+
+# Combine all models together
+fit_all_models <- fit_all_models_1 %>% 
+  left_join(fit_all_models_2, by = "id")
+
+# Save models
+write_rds(fit_all_models, 
+  file.path(path_models, "fit_all_models.rds"), 
+  compress = "gz")
+```
+
+```{r load-models}
+# Load all models
+fit_all_models <- read_rds(file.path(path_models, "fit_all_models.rds"))
+
+get_best_model_column <- function(data, ...) {
+  transmute(data, ..., best_model = get(data$.model))
+}
+
+# Keep only the best model for each `id`
+fit_best_models <- fit_all_models %>% 
+  left_join(select(acc_best_models, id, .model), by = "id") %>% 
+  split(.$id) %>%
+  map_df(get_best_model_column, id, .model) %>%
+  as_mable(key = "id", model = "best_model")
+```
+
+```{r generate-forecasts-for-2018}
+# Generate forecasts for the future (2018)
+fc_future <- fit_best_models %>% 
+  select(-.model) %>% 
+  forecast(new_data = test_data)
+```
+
+```{r viz-final-forecast}
+this_id <- "Cluster 1__Brand Group 31"
+fc_future %>% 
+  filter(id == this_id) %>% 
+  autoplot(bind_rows(train_data, valid_data), level = 90) +
+  facet_wrap(~id) +
+  theme(legend.position = "none") +
+  labs(x = NULL, y = NULL) +
+  scale_y_continuous(
+    labels = scales::label_number(suffix = "K", scale = 1e-3)
+  )
+```
+
+# Resource Allocation
+
+Resource allocation methods can be used in almost every aspect of supply chain management.
+The common goal is allocate the resources effectively (i.e., maximizing the revenue,
+minimizing the cost, or optimizing the utilization sequence) while satisfying certain
+constraints (e.g., resource availability, customer service level, back order level,
+delivery window). In this case, resources refers to investments.
+
+In this second part of the challenge, Novartis ask to the participants to provide the
+optimal allocation of their resources for the year 2018, as well as, showing differences
+of allocations by cluster/brand/investment type and impact on sales. Investments are now
+compressed into *Investment 1*, *Investment 2* and *Others*.
+
+The template file provided by the organization looks as follow:
+
+```{r read-template-data}
+sub_template_2 <- 
+  read_csv(file.path(path_data, "Submission_Template2.csv")) %>%
+  rename(
+    cluster = Cluster,
+    brand = `Brand Group`, 
+    `function` = Function
+  )
+
+# Show first rows and columns
+head(sub_template_2, 3) %>% 
+  to_html(digits = 1)
+```
+
+Create the new variable `investment_others`, and remove unnecessary columns.
+
+```{r create-investment-others, echo=TRUE}
+alloc_df <- all_levels_tbl %>% 
+  mutate(
+    investment_others = investment_3 + investment_4 + 
+      investment_5 + investment_6
+  ) %>% 
+  select(-c(investment_3, investment_4, investment_5, investment_6))
+```
+
+```{r print-alloc_df}
+# Show first rows and columns
+head(alloc_df, 3) %>% 
+  to_html(digits = 1)
+```
+
+## Forecasting model
+
+We need a forecasting model with investments as predictors. Ideally, the model obtained in
+the first challenge is the one that we should use to perform the optimization. However,
+some of the models are univariate and in any case the variable `investment_others` has
+been used. Therefore, a linear regression model will be used, which will use the trend,
+the seasonality and the investments as predictors.
+
+*Note: we should look for the best model possible that contains investments as
+predictors.*
+
+```{r res-alloc-split-data}
+train_data_alloc <- alloc_df %>% 
+  filter(date < yearmonth(first_date_submission))
+
+test_data_alloc <- alloc_df %>% 
+  filter(date >= yearmonth(first_date_submission))
+```
+
+```{r res-alloc-model-definition, echo=TRUE}
+models_alloc <- list(
+  lm = TSLM(sales_2 ~ trend() + season() + investment_1 + investment_2 +
+              investment_others)
+)
+```
+
+Then, train the models and generate the forecasts for the next 12 months
+
+```{r res-alloc-fit-models, echo=TRUE}
+# Train models
+fit_alloc <- train_data_alloc %>% 
+  model(!!!models_alloc)
+
+# Generate forecasts for the test period
+fc_alloc <- fit_alloc %>% 
+  forecast(new_data = test_data_alloc)
+```
+
+```{r res-alloc-viz-1}
+# Once the models are trained, we can visualize the predictions for the next 12 months.
+# fc_alloc %>% 
+#   filter(id == "Cluster 5__Brand Group 96, 97") %>% 
+#   autoplot(train_data_alloc, alpha = 0.5, level = NULL, size = 1) +
+#   facet_wrap(~ id) +
+#   labs(x = NULL, y = NULL) +
+#   scale_y_continuous(
+#     labels = scales::label_number(suffix = "K", scale = 1e-3)
+#   )
+```
+
+```{r aggregate-forecast-2018}
+fc_agg_2018 <- fc_alloc %>% 
+  as_tibble() %>% 
+  group_by(id, .model) %>% 
+  summarise(ForecastedSales = sum(.mean))
+```
+
+## Simulations
+
+When a closed form is not available to estimate the value of a parameter, either because
+it does not have a closed form formula or because there are too many factor that influence
+in the final result, the use of simulation techniques are commonly used to observe the
+behavior of the variable to be analyzed.
+
+The model will be fed with variations of the investments to obtain different forecasts.
+Sometimes reducing the amount invested on one side to place it in another can lead to
+better results, and vice versa.
+
+The steps to follow are:
+
+1.  Create a matrix with the weights combinations
+2.  Calculate the new simulated investments
+3.  Generate the forecast with the new simulated values
+
+### Simulation weights {#simulation-weights}
+
+We create a mesh of values that allow us to evaluate different scenarios. The following
+restrictions have been applied:
+
+-   The weights must add up to 1
+
+-   In order to diversify, the maximum allocation will be 80% of the capital.
+
+```{r random-weights}
+# # https://stackoverflow.com/questions/43156550/generate-a-random-matrix-in-r-which-the-sum-of-each-rows-is-equal-to-1
+
+# Create random weights
+# rand_weights <- function(n) {
+#   x <- sort(runif(n - 1))
+#   c(x, 1) - c(0, x)
+# }
+# weeights_df <- 
+#   as_tibble(t(replicate(4, rand_weights(3)))) %>% 
+#   set_names(c("investment_1", "investment_2", "investment_others"))
+# weeights_df
+```
+
+```{r crossing-weights}
+weights_df <- crossing(
+  investment_1 = seq(0, 0.8, by = 0.05), 
+  investment_2 = seq(0, 0.8, by = 0.05),
+  investment_others = seq(0, 0.8, by = 0.05)
+  ) %>% 
+  filter(investment_1 + investment_2 + investment_others == 1) %>% 
+  mutate(
+    comb_id = row_number(), .before = 1L, 
+    comb_desc = sprintf("[%.2f, %.2f, %.2f]", 
+                        investment_1, investment_2, investment_others)
+  )
+```
+
+```{r print-mesh-of-weights}
+head(weights_df) %>% 
+  to_html(digits = 2, full_width = FALSE)
+```
+
+A total of `r max(weights_df$comb_id, na.rm = TRUE)` combinations per series will be
+evaluated.
+
+### Create scenarios
+
+To generate the multiple scenarios we must multiply the weights generated in the [previous
+section](#simulation-weights) with the values of the investments. To do this, we will help
+ourselves with the following function:
+
+```{r get-future-scenerarios-function, echo=TRUE}
+get_future_scenerarios <- function(future_data, weights_df) {
+  
+  # Store id data
+  id_df <- future_data %>% 
+    select(id, date)
+  
+  # Calculate total invested in each product-month
+  total_invested <- future_data %>% 
+    transmute(total = rowSums(across(contains("investment"))))
+  
+  # Repeat `total_invested` column 3 times (one for each investment)
+  inv <- replicate(n = 3, total_invested$total) 
+  
+  # Loop through weights
+  inv_cols <- str_subset(names(weights_df), "investment")
+  scenarios_list <- vector("list", length = nrow(weights_df))
+  for (i in seq(1, nrow(weights_df))) {
+    
+    # Weights for this iteration
+    w <- weights_df[i, inv_cols]
+    w <- as.numeric(w)
+    
+    # New investments
+    new_investments <- t(w * t(inv))
+    colnames(new_investments) <- inv_cols
+
+    future_scenario <- id_df %>% 
+      bind_cols(weights_df[i, "comb_id"]) %>% 
+      bind_cols(as_tibble(new_investments))
+    
+    scenarios_list[[i]] <- future_scenario
+  }
+  
+  # Return a list with all the simulations
+  scenarios_list
+}
+```
+
+```{r generate-scenarios}
+# New predictors to be fed into the model
+future_scenarios <- get_future_scenerarios(test_data_alloc, weights_df)
+
+# Forecasts with the simulated data
+fc <- fit_alloc %>% 
+  forecast(new_data = future_scenarios)
+```
+
+In gray-blue color we see the possible scenarios of the forecast. Each scenario
+corresponds to a different weight combination. In orange we have the median and in another
+shade of blue the 80th quantile.
+
+```{r viz-simulations}
+this_id <- "Cluster 1__Brand Group 31"
+
+fc_agg <- fc %>% 
+  filter(id == this_id) %>% 
+  as_tibble() %>% 
+  group_by(id, .model, date) %>% 
+  summarise(
+    median = median(.mean), 
+    upper = quantile(.mean, probs = 0.80),
+    lower = quantile(.mean, probs = 0.20), 
+    .groups = "drop"
+  )
+
+train_data_alloc %>% 
+  filter(id == this_id) %>%
+  autoplot(sales_2) +
+  autolayer(
+    fc %>% filter(id == this_id),
+    level = NULL, alpha = 0.05
+  ) +
+  geom_line(
+    data = fc_agg, mapping = aes(y = median),
+    colour = "orange", size = 1, alpha = 0.7
+  ) +
+  scale_y_continuous(
+    labels = scales::label_number(suffix = "K", scale = 1e-3)
+  ) +
+  geom_line(
+    data = fc_agg, mapping = aes(y = upper),
+    colour = "steelblue", size = 1, alpha = 0.5
+  ) +
+  # geom_line(
+  #   data = fc_agg, mapping = aes(y = lower), 
+  #   colour = "orange", size = 1, alpha = 0.5
+  # ) +
+  facet_wrap(~ id) +
+  theme(legend.position = "none") +
+  labs(x = NULL, y = NULL)
+```
+
+### Find optimal values
+
+We will use the 80th quantile as the best combination. We could use the combination of
+parameters that has generated the greatest benefits, but it would be select the best
+optimistic scenario and we prefer to be more conservative.
+
+First, we calculate the total amount of each simulation
+
+```{r find-optimzal-values, echo=TRUE}
+simulations_agg <- fc %>% 
+  as_tibble() %>% 
+  group_by(id, comb_id) %>% 
+  summarise(across(contains(".mean") | contains("investment"), sum)) %>%
+  ungroup() %>% 
+  rename(OptimalSales = .mean) %>% 
+  arrange(desc(OptimalSales)) %>% 
+  left_join(select(weights_df, comb_id, comb_desc), by = "comb_id")
+```
+
+Then, select the combination that meets our requirements: `pct_rank <= 0.8`
+
+```{r optimal-values-by-id, echo=TRUE}
+# Find best combination of weights for each `id`
+optimal_simulation_id <- simulations_agg %>% 
+  group_by(id) %>%
+  summarise(
+    comb_id = comb_id,
+    OptimalSales = OptimalSales,
+    pct_rank = percent_rank(OptimalSales)
+  ) %>% 
+  # Select 80 percentile
+  filter(pct_rank <= 0.8) %>% 
+  slice_max(pct_rank) %>%
+  # In case of tie, choose the first one. This happens
+  # in `Cluster 5__Brand Group 30`
+  slice_head(n = 1) %>% 
+  ungroup()
+```
+
+```{r optimal-values-dataframe}
+# For each `id` select the best `comb_id` of the aggregated values 
+optimal_simulation_df <- simulations_agg %>% 
+  semi_join(optimal_simulation_id, by = c("id", "comb_id"))
+```
+
+Finally, prepare the output data
+
+```{r prepare-submission-data}
+submission_tbl <- optimal_simulation_df %>% 
+  pivot_longer(
+    cols = -c(id, comb_id, comb_desc, OptimalSales), 
+    names_to = "function", 
+    values_to = "OptimiseInvestment"
+  ) %>% 
+  left_join(fc_agg_2018, by = "id") %>% 
+  select(id, `function`, OptimiseInvestment, ForecastedSales, OptimalSales)
+
+
+head(submission_tbl) %>% 
+  to_html(digits = 0)
+```
+
+According to the simulation results, we could have had a profit of \~ 500k in 2018.
+
+```{r}
+submission_tbl %>% 
+  filter(`function` == "investment_1") %>% 
+  summarise(across(is.numeric, sum)) %>% 
+  mutate(Profit = OptimalSales - ForecastedSales) %>% 
+  add_column(Year = "2018", .before = 1L) %>% 
+  to_html(digits = 0, full_width = FALSE)
+```
+
+## Evolution of investments
+
+The evolution of the investments over the years is shown below.It can be seen how, in
+general terms, the investments for 2018 are aligned with the historical trends and do not
+different sharply from the recent past. However, there are some investments that have been
+affected more than the rest.
+
+```{r weights-analysis-01}
+weights_2018 <- optimal_simulation_df %>% 
+  separate(id, into = c("cluster", "brand"), sep = "__", remove = FALSE) %>% 
+  group_by(brand, year = 2018) %>% 
+  summarise(across(contains("investment"), sum))
+
+# Weights by year
+plot_data <- train_data_alloc %>% 
+  as_tibble() %>% 
+  group_by(brand, year = year(date)) %>% 
+  summarise(across(contains("investment"), sum)) %>% 
+  filter(year >= 2014) %>% 
+  bind_rows(weights_2018)
+```
+
+```{r viz-evolution-inv-1, fig.height=5, fig.width=8}
+plot_data %>% 
+  pivot_wider(
+    id_cols = brand, 
+    names_from = year, 
+    values_from = investment_1
+  ) %>% 
+  mutate(id_num = str_replace(brand, "Brand Group ", "") %>% as.integer()) %>% 
+  plot_ly() %>% 
+  add_trace(
+    type = 'parcoords',
+    line = list(
+      color = ~id_num,
+      colorscale = 'Jet',
+      showscale = TRUE,
+      reversescale = TRUE
+    ),
+    dimensions = list(
+      list(range = c(-25e4, 0), label = "2014", values = ~ `2014`),
+      list(range = c(-25e4, 0), label = "2015", values = ~ `2015`),
+      list(range = c(-25e4, 0), label = "2016", values = ~ `2016`),
+      list(range = c(-25e4, 0), label = "2017", values = ~ `2017`),
+      list(range = c(-25e4, 0), label = "2018", values = ~ `2018`)
+    )
+  ) %>% 
+  layout(title = list(text = "Evolution of Investment 1"))
+```
+
+```{r viz-evolution-inv-2, fig.height=5, fig.width=8}
+plot_data %>% 
+  pivot_wider(
+    id_cols = brand, 
+    names_from = year, 
+    values_from = investment_2
+  ) %>% 
+  mutate(id_num = str_replace(brand, "Brand Group ", "") %>% as.integer()) %>% 
+  plot_ly() %>% 
+  add_trace(
+    type = 'parcoords',
+    line = list(
+      color = ~id_num,
+      colorscale = 'Jet',
+      showscale = TRUE,
+      reversescale = TRUE
+    ),
+    dimensions = list(
+      list(range = c(-1e5, 0), label = "2014", values = ~ `2014`),
+      list(range = c(-1e5, 0), label = "2015", values = ~ `2015`),
+      list(range = c(-1e5, 0), label = "2016", values = ~ `2016`),
+      list(range = c(-1e5, 0), label = "2017", values = ~ `2017`),
+      list(range = c(-1e5, 0), label = "2018", values = ~ `2018`)
+    )
+  ) %>% 
+  layout(title = "Evolution of Investment 2")
+```
+
+In general, it is suggested to invest more in *others* for the 2018.
+
+```{r viz-evolution-inv-others, fig.height=5, fig.width=8}
+plot_data %>% 
+  pivot_wider(
+    id_cols = brand, 
+    names_from = year, 
+    values_from = investment_others
+  ) %>% 
+  mutate(id_num = str_replace(brand, "Brand Group ", "") %>% as.integer()) %>% 
+  plot_ly() %>% 
+  add_trace(
+    type = 'parcoords',
+    line = list(
+      color = ~id_num,
+      colorscale = 'Jet',
+      showscale = TRUE,
+      reversescale = TRUE
+    ),
+    dimensions = list(
+      list(range = c(-7.1e4, 0), label = "2014", values = ~ `2014`),
+      list(range = c(-7.1e4, 0), label = "2015", values = ~ `2015`),
+      list(range = c(-7.1e4, 0), label = "2016", values = ~ `2016`),
+      list(range = c(-7.1e4, 0), label = "2017", values = ~ `2017`),
+      list(range = c(-7.1e4, 0), label = "2018", values = ~ `2018`)
+    )
+  ) %>% 
+  layout(title = "Evolution of Investment Others")
+```
+
+# What's next
+
+I will leave some ideas that be explored to expand the analysis
+
+-   Remove outliers and clean the data.
+-   Time series clustering based on features such as trend strength, seasonality,
+    spikiness, linearity, autocorrelation, etc.
+-   Test if ensembles do improve the accuracy. There are many types of ensembles to
+    explore: combination ensembles, weighted average ensembles based on cross validation
+    errors or even more advanced using regularized linear models to name a few.
+-   Use more than one fold to select the best models, i.e use time series cross
+    validation.
+-   Directly find the best model in the first challenge so it can be used in the
+    optimization problem.
+-   Try others methods such as prophet, machine learning or others.
+-   Account for uncertainty measures, because all is not about accuracy, prediction
+    intervals are also important.
+-   Try other optimization methods
