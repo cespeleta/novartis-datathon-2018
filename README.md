@@ -20,6 +20,12 @@ if (!requireNamespace("remotes"))
 remotes::install_github("rstudio/renv")
 ```
 
+Initialize a new project-local environment with a private R library.
+
+```r
+renv::init()
+```
+
 Install all the packages declared in the lockfile (`renv.lock`)
 
 ```r
@@ -31,4 +37,3 @@ renv::restore()
 Carlos Espeleta - @Carlos_Espeleta
 
 LinkedIn: https://www.linkedin.com/in/carlos-espeleta
-
